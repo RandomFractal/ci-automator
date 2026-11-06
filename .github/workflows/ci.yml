@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [x86_64-unknown-linux-musl]
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -35,7 +35,12 @@ jobs:
         run: |
           bin=target/${{ matrix.target }}/release/cia
           file "$bin" | grep -q 'statically linked\|static-pie linked'
-          "$bin" --version
+          if [ "${{ matrix.target }}" = aarch64-unknown-linux-musl ]; then
+            sudo apt-get update -q && sudo apt-get install -yq qemu-user-static
+            qemu-aarch64-static "$bin" --version
+          else
+            "$bin" --version
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: cia-${{ matrix.target }}
