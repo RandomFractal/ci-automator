@@ -6,6 +6,14 @@ CI Automation Service - for when Actions isn't available - Built in Rust
 
 ## Install
 
+Download `cia-x86_64-unknown-linux-musl` or `cia-aarch64-unknown-linux-musl` from the [latest release](https://github.com/RandomFractal/ci-automator/releases/latest), check it against `SHA256SUMS`, and install it as `cia`:
+
+```bash
+install -m 755 cia-x86_64-unknown-linux-musl ~/.local/bin/cia
+```
+
+To build from source instead, use `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl` as the target:
+
 ```bash
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
@@ -92,3 +100,7 @@ journalctl --user -u cia-home-me-app.service -f
 ```
 
 Git commands in the service cannot prompt for anything. Use a deploy key without a passphrase or stored HTTPS credentials for the remote.
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, merge, then push a matching tag, e.g. `git tag v0.1.0 && git push origin v0.1.0`. The release workflow runs CI, then publishes both static binaries and `SHA256SUMS` to a GitHub release. It fails if the tag doesn't match `Cargo.toml`.
