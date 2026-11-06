@@ -46,3 +46,29 @@ jobs:
           name: cia-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/cia
           if-no-files-found: error
+
+  # RHEL 7 ships glibc 2.17 and git 1.8.3. Run the musl test binaries there
+  # against its stock git, mounted at the same path so CARGO_BIN_EXE_cia resolves.
+  rhel7:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build test binaries
+        run: |
+          cargo test --locked --target x86_64-unknown-linux-musl --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable) | .executable' \
+            > test-bins
+          cat test-bins
+      - name: Run tests in centos:7
+        run: |
+          docker run --rm -v "$PWD:$PWD" -w "$PWD" centos:7 sh -euc '
+            sed -i -e "s/^mirrorlist=/#mirrorlist=/" \
+                   -e "s|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|" \
+                   /etc/yum.repos.d/CentOS-*.repo
+            yum -q -y install git
+            git --version
+            while read -r t; do "$t"; done < test-bins
+          '
