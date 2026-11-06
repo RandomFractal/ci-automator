@@ -266,3 +266,18 @@ fn config_commands() {
     );
     assert!(!env.cia(&["--deploy", "--global"]).status.success());
 }
+
+#[test]
+fn runs_run_and_uv_sections_in_file_order() {
+    let env = Env::new("");
+    assert!(env.cia(&["--add-branch", "main"]).status.success());
+    assert!(env.cia(&["--deploy"]).status.success());
+
+    env.push(
+        "DEPLOY.cia",
+        "[run]\nrun = ['uv build']\n\n[uv]\nrun = ['fast restart']\n",
+    );
+    let out = env.cia(&["--deploy"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(env.uv_calls(), ["build", "run fast restart"]);
+}

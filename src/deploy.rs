@@ -29,45 +29,47 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DeployFile {
-    uv: Option<UvSection>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UvSection {
+struct Section {
     run: Vec<String>,
     timeout: Option<Interval>,
 }
 
 struct Step {
-    program: &'static str,
+    program: String,
     args: Vec<String>,
     timeout: Interval,
 }
 
 impl Step {
     fn display(&self) -> String {
-        shell_words::join(std::iter::once(self.program).chain(self.args.iter().map(String::as_str)))
+        shell_words::join(std::iter::once(&self.program).chain(&self.args))
     }
 }
 
+/// Sections run in the order they appear in the file.
 fn parse_steps(text: &str) -> Result<Vec<Step>> {
-    let file: DeployFile =
+    let table: toml::Table =
         toml::from_str(text).with_context(|| format!("invalid {DEPLOY_FILE}"))?;
     let mut steps = Vec::new();
-    if let Some(uv) = file.uv {
-        let timeout = uv.timeout.unwrap_or(DEFAULT_TIMEOUT);
-        for entry in &uv.run {
+    for (name, value) in table {
+        let prefix: &[&str] = match name.as_str() {
+            "uv" => &["uv", "run"],
+            "run" => &[],
+            _ => bail!("unknown section [{name}] in {DEPLOY_FILE}"),
+        };
+        let section = Section::deserialize(value)
+            .with_context(|| format!("invalid [{name}] section in {DEPLOY_FILE}"))?;
+        let timeout = section.timeout.unwrap_or(DEFAULT_TIMEOUT);
+        for entry in &section.run {
             let words = shell_words::split(entry)
-                .with_context(|| format!("invalid [uv] run entry {entry:?}"))?;
+                .with_context(|| format!("invalid [{name}] run entry {entry:?}"))?;
             if words.is_empty() {
-                bail!("empty [uv] run entry in {DEPLOY_FILE}");
+                bail!("empty [{name}] run entry in {DEPLOY_FILE}");
             }
-            let args = std::iter::once("run".to_string()).chain(words).collect();
+            let mut words = prefix.iter().map(|w| w.to_string()).chain(words);
             steps.push(Step {
-                program: "uv",
-                args,
+                program: words.next().unwrap_or_default(),
+                args: words.collect(),
                 timeout,
             });
         }
@@ -368,7 +370,7 @@ fn run_step(repo: &Repo, log: &Logger, step: &Step) -> Result<()> {
     let name = step.display();
     log.event(&format!("running {name}"));
     let started = Instant::now();
-    let mut child = Command::new(step.program)
+    let mut child = Command::new(&step.program)
         .args(&step.args)
         .current_dir(&repo.root)
         .stdin(Stdio::null())
@@ -490,6 +492,25 @@ mod tests {
     }
 
     #[test]
+    fn run_entries_run_directly() {
+        let steps = parse_steps("[run]\nrun = ['systemctl --user restart app']\n").unwrap();
+        assert_eq!(steps[0].program, "systemctl");
+        assert_eq!(steps[0].args, ["--user", "restart", "app"]);
+    }
+
+    #[test]
+    fn sections_run_in_file_order() {
+        let text = "[run]\nrun = ['make']\ntimeout = '1m'\n[uv]\nrun = ['migrate']\n";
+        let steps = parse_steps(text).unwrap();
+        assert_eq!(steps[0].display(), "make");
+        assert_eq!(steps[0].timeout, Interval::new(1, 'm'));
+        assert_eq!(steps[1].display(), "uv run migrate");
+        assert_eq!(steps[1].timeout, DEFAULT_TIMEOUT);
+        let reversed = "[uv]\nrun = ['migrate']\n[run]\nrun = ['make']\n";
+        assert_eq!(parse_steps(reversed).unwrap()[0].program, "uv");
+    }
+
+    #[test]
     fn shell_syntax_is_not_interpreted() {
         let steps = parse_steps("[uv]\nrun = ['app; rm -rf /']\n").unwrap();
         assert_eq!(steps[0].args, ["run", "app;", "rm", "-rf", "/"]);
@@ -506,6 +527,8 @@ mod tests {
         assert!(parse_steps("[uvv]\nrun = ['x']\n").is_err());
         assert!(parse_steps("[uv]\nruns = ['x']\n").is_err());
         assert!(parse_steps("[uv]\nrun = ['']\n").is_err());
+        assert!(parse_steps("[run]\nrun = ['  ']\n").is_err());
+        assert!(parse_steps("uv = 'x'\n").is_err());
     }
 
     #[test]

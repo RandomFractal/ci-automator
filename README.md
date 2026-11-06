@@ -67,12 +67,15 @@ Runs take a lock, so a manual `--deploy` cannot overlap the service.
 ## `DEPLOY.cia`
 
 ```toml
+[run]
+run = ['make build']     # runs: make build
+timeout = '10m'          # optional, per step; default 10m
+
 [uv]
 run = ['fast restart']   # runs: uv run fast restart
-timeout = '10m'          # optional, per step; default 10m
 ```
 
-Each entry is split like a shell command, so quotes group words, and it runs directly, never through a shell. When a step exceeds its timeout, cia kills it and every process it started. Unknown sections or keys are an error.
+`[run]` entries run as given. `[uv]` entries run with `uv run` in front. Sections run in the order they appear in the file, and each section's entries run in order. Each entry is split like a shell command, so quotes group words, and it runs directly, never through a shell. When a step exceeds its timeout, cia kills it and every process it started. Unknown sections or keys are an error.
 
 A step may leave a server running in the background. cia stops recording the server's output a couple of seconds after the step exits.
 
