@@ -238,6 +238,16 @@ fn dry_run_changes_nothing() {
     );
     assert!(!env.path("host/DEPLOY.cia").exists());
     assert!(env.uv_calls().is_empty());
+
+    env.cia(&["--deploy"]);
+    let out = env.cia(&["--deploy", "--dry-run"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("already deployed"), "{stdout}");
+    assert!(
+        stdout.contains("would not run: uv run fast restart"),
+        "{stdout}"
+    );
+    assert_eq!(env.uv_calls().len(), 1);
 }
 
 #[test]

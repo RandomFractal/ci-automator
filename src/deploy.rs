@@ -365,23 +365,23 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
         println!("{branch} is up to date with {upstream}");
     }
 
-    match decide(&state, &remote, pulled, force) {
+    let will_run = match decide(&state, &remote, pulled, force) {
         Decision::AlreadyDeployed => {
             println!(
                 "{} is already deployed; nothing would run (use --force)",
                 short(&remote)
             );
-            return Ok(());
+            false
         }
         Decision::RecordBaseline => {
             println!(
                 "no deploy recorded yet; would record {} as the baseline without running anything",
                 short(&remote)
             );
-            return Ok(());
+            false
         }
-        Decision::Run => {}
-    }
+        Decision::Run => true,
+    };
 
     let text = if pulled {
         repo.read_file_at(&remote, DEPLOY_FILE)?
@@ -399,8 +399,16 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
     if steps.is_empty() {
         println!("{DEPLOY_FILE} defines nothing to run");
     }
+    let label = if will_run {
+        "would run"
+    } else {
+        "would not run"
+    };
     for step in &steps {
-        println!("would run: {} (timeout {})", step.display(), step.timeout);
+        println!("{label}: {} (timeout {})", step.display(), step.timeout);
+    }
+    if !will_run {
+        return Ok(());
     }
     if let Some(good) = state
         .last_deployed
