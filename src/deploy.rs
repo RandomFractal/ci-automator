@@ -18,7 +18,7 @@ use crate::{
     config,
     git::{Repo, short},
     interval::Interval,
-    log::{Logger, now},
+    log::{DEPLOY_START, Logger, now},
     state::State,
 };
 
@@ -263,7 +263,7 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     }
 
     log.event(&format!(
-        "deploying {branch} at {}{}",
+        "{DEPLOY_START}{branch} at {}{}",
         short(&head),
         if force { " (forced)" } else { "" }
     ));

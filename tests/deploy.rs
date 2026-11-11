@@ -399,3 +399,19 @@ fn rollback_can_be_turned_off() {
     assert!(!env.cia(&["--deploy"]).status.success());
     assert_eq!(env.uv_calls(), ["run good", "run bad", "run bad"]);
 }
+
+#[test]
+fn log_last_shows_only_the_last_deploy() {
+    let env = Env::new("echo \"output of $2\"");
+    env.cia(&["--add-branch", "main"]);
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uv]\nrun = ['first']\n");
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uv]\nrun = ['second']\n");
+    env.cia(&["--deploy"]);
+    let out = env.cia(&["--log", "--last"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(stdout.contains("output of second"), "{stdout}");
+    assert!(!stdout.contains("output of first"), "{stdout}");
+}

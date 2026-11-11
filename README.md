@@ -42,7 +42,7 @@ cia --install-service        # start a systemd service that runs --watch for thi
 | `--deploy [--force] [--dry-run]` | Run one deploy check |
 | `--watch` | Run `--deploy` every interval, re-reading the config each time |
 | `--status` | Show the last run, last deploy, any error, and service state |
-| `--log [-n N] [--activity]` | Print the end of the events log, or the activity log |
+| `--log [-n N] [--activity] [--last]` | Print the end of the events log, or the activity log; `--last` prints only the last deploy |
 | `--install-service` / `--uninstall-service` | Manage this repo's systemd service |
 
 `--global` applies config commands to the global config, and service commands to a system-wide service.

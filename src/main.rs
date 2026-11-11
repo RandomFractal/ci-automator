@@ -104,6 +104,10 @@ struct Cli {
     #[arg(long, requires = "log")]
     activity: bool,
 
+    /// With --log: print only the last deploy, from its start to the end of the log
+    #[arg(long, requires = "log", conflicts_with = "activity")]
+    last: bool,
+
     /// With --log: number of lines to print
     #[arg(
         short = 'n',
@@ -171,7 +175,13 @@ fn run(cli: Cli) -> Result<bool> {
         } else {
             logger.events
         };
-        match log::tail(&path, cli.lines)? {
+        let lines = if cli.last {
+            log::last_deploy(&path)?
+        } else {
+            log::tail(&path, cli.lines)?
+        };
+        match lines {
+            Some(lines) if lines.is_empty() => println!("no deploy in {}", path.display()),
             Some(lines) => lines.iter().for_each(|l| println!("{l}")),
             None => println!("no log yet at {}", path.display()),
         }
@@ -291,6 +301,7 @@ fn status(repo: &Repo) -> Result<()> {
     );
     if let Some(err) = &state.last_error {
         println!("last error:    {err}");
+        println!("               run cia --log --last for the last deploy's output");
     }
     if let Some(sha) = &state.last_failed {
         println!(

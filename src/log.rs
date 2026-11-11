@@ -72,19 +72,34 @@ pub fn now() -> String {
     humantime::format_rfc3339_seconds(SystemTime::now()).to_string()
 }
 
+/// Marks the start of a deploy in the events log; `last_deploy` finds it.
+pub const DEPLOY_START: &str = "deploying ";
+
 pub fn tail(path: &Path, lines: usize) -> Result<Option<Vec<String>>> {
-    let text = match fs::read(path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
-    };
-    let all: Vec<&str> = text.lines().collect();
-    Ok(Some(
-        all[all.len().saturating_sub(lines)..]
-            .iter()
-            .map(|l| l.to_string())
-            .collect(),
-    ))
+    Ok(read_lines(path)?.map(|all| all[all.len().saturating_sub(lines)..].to_vec()))
+}
+
+/// Lines from the start of the last deploy to the end of the log, or empty if it has none.
+pub fn last_deploy(path: &Path) -> Result<Option<Vec<String>>> {
+    let marker = format!(" EVENT {DEPLOY_START}");
+    Ok(read_lines(path)?.map(|all| {
+        all.iter()
+            .rposition(|l| l.contains(&marker))
+            .map_or_else(Vec::new, |i| all[i..].to_vec())
+    }))
+}
+
+fn read_lines(path: &Path) -> Result<Option<Vec<String>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(String::from)
+                .collect(),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
 }
 
 fn append(path: &Path, max_bytes: u64, backups: u32, level: &str, msg: &str) {
@@ -150,5 +165,21 @@ mod tests {
         fs::write(&path, "a\nb\nc\n").unwrap();
         assert_eq!(tail(&path, 2).unwrap().unwrap(), vec!["b", "c"]);
         assert!(tail(&dir.path().join("missing"), 2).unwrap().is_none());
+    }
+
+    #[test]
+    fn last_deploy_starts_at_the_last_deploying_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.log");
+        fs::write(
+            &path,
+            "t EVENT deploying main at a\nt OUT   one\nt EVENT deploying main at b\nt OUT   two\n",
+        )
+        .unwrap();
+        let lines = last_deploy(&path).unwrap().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with("at b") && lines[1].ends_with("two"));
+        fs::write(&path, "t EVENT pulled\n").unwrap();
+        assert!(last_deploy(&path).unwrap().unwrap().is_empty());
     }
 }
