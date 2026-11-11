@@ -186,8 +186,8 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     let Some(branch) = repo.branch()? else {
         return Ok(skip(log, "skipped: HEAD is detached"));
     };
-    let targets = config::effective(repo)?.branches;
-    if !targets.contains(&branch) {
+    let cfg = config::effective(repo)?;
+    if !cfg.branches.contains(&branch) {
         return Ok(skip(
             log,
             &format!("skipped: {branch} is not a target branch"),
@@ -197,6 +197,13 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     repo.git(&["fetch", "--quiet"])?;
     let before = repo.git(&["rev-parse", "HEAD"])?;
     let remote = repo.git(&["rev-parse", "@{u}"])?;
+    if !force && state.last_failed.as_deref() == Some(remote.as_str()) {
+        bail!(
+            "{upstream} is still at {}, which failed and was rolled back; \
+             push a fix or use cia --deploy --force",
+            short(&remote)
+        );
+    }
     let pulled = before != remote;
     if pulled {
         ensure_fast_forward(repo, &branch, &upstream, &before, &remote)?;
@@ -238,10 +245,13 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
         Decision::Run => {}
     }
 
-    let steps = match fs::read_to_string(repo.root.join(DEPLOY_FILE)) {
-        Ok(text) => parse_steps(&text)?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(e).with_context(|| format!("cannot read {DEPLOY_FILE}")),
+    let good = state
+        .last_deployed
+        .clone()
+        .filter(|good| cfg.rollback && *good != head);
+    let steps = match read_steps(repo) {
+        Ok(steps) => steps,
+        Err(e) => return Err(roll_back(repo, log, state, &head, good, false, e)),
     };
     if steps.is_empty() {
         log.event(&format!(
@@ -259,8 +269,8 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     ));
     state.last_attempted = Some(head.clone());
     let started = Instant::now();
-    for step in &steps {
-        run_step(repo, log, step)?;
+    if let Err(e) = steps.iter().try_for_each(|step| run_step(repo, log, step)) {
+        return Err(roll_back(repo, log, state, &head, good, true, e));
     }
     log.event(&format!(
         "deployed {branch} at {} in {}",
@@ -271,13 +281,60 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     Ok(format!("deployed {}", short(&head)))
 }
 
+fn read_steps(repo: &Repo) -> Result<Vec<Step>> {
+    match fs::read_to_string(repo.root.join(DEPLOY_FILE)) {
+        Ok(text) => parse_steps(&text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {DEPLOY_FILE}")),
+    }
+}
+
+/// Resets to the last good commit and re-runs its steps, unless no step ran.
+/// Returns the deploy error with the rollback's outcome added.
+fn roll_back(
+    repo: &Repo,
+    log: &Logger,
+    state: &mut State,
+    failed: &str,
+    good: Option<String>,
+    steps_ran: bool,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let Some(good) = good else {
+        return err;
+    };
+    log.event(&format!(
+        "{err:#}; rolling back from {} to {}",
+        short(failed),
+        short(&good)
+    ));
+    state.last_failed = Some(failed.to_string());
+    let result = repo
+        .git(&["reset", "--hard", "--quiet", &good])
+        .and_then(|_| {
+            if steps_ran {
+                read_steps(repo)?
+                    .iter()
+                    .try_for_each(|step| run_step(repo, log, step))?;
+            }
+            Ok(())
+        });
+    match result {
+        Ok(()) => {
+            log.event(&format!("rolled back to {}", short(&good)));
+            anyhow::anyhow!("{err:#}; rolled back to {}", short(&good))
+        }
+        Err(e) => anyhow::anyhow!("{err:#}; rollback to {} failed: {e:#}", short(&good)),
+    }
+}
+
 fn dry_run(repo: &Repo, force: bool) -> Result<()> {
     let Some(branch) = repo.branch()? else {
         println!("HEAD is detached; nothing would run");
         return Ok(());
     };
-    let targets = config::effective(repo)?.branches;
-    if !targets.contains(&branch) {
+    let cfg = config::effective(repo)?;
+    if !cfg.branches.contains(&branch) {
         println!("{branch} is not a target branch; nothing would run");
         return Ok(());
     }
@@ -285,6 +342,14 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
     repo.git(&["fetch", "--quiet"])?;
     let head = repo.git(&["rev-parse", "HEAD"])?;
     let remote = repo.git(&["rev-parse", "@{u}"])?;
+    let state = State::load(repo)?;
+    if !force && state.last_failed.as_deref() == Some(remote.as_str()) {
+        println!(
+            "{upstream} is still at {}, which failed and was rolled back; nothing would run (use --force)",
+            short(&remote)
+        );
+        return Ok(());
+    }
     let pulled = head != remote;
     if pulled {
         ensure_fast_forward(repo, &branch, &upstream, &head, &remote)?;
@@ -300,7 +365,7 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
         println!("{branch} is up to date with {upstream}");
     }
 
-    match decide(&State::load(repo)?, &remote, pulled, force) {
+    match decide(&state, &remote, pulled, force) {
         Decision::AlreadyDeployed => {
             println!(
                 "{} is already deployed; nothing would run (use --force)",
@@ -337,6 +402,13 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
     for step in &steps {
         println!("would run: {} (timeout {})", step.display(), step.timeout);
     }
+    if let Some(good) = state
+        .last_deployed
+        .as_deref()
+        .filter(|g| cfg.rollback && *g != remote)
+    {
+        println!("if a step fails, would roll back to {}", short(good));
+    }
     Ok(())
 }
 
@@ -346,6 +418,7 @@ fn skip(log: &Logger, msg: &str) -> String {
 }
 
 fn mark_deployed(state: &mut State, head: &str) {
+    state.last_failed = None;
     state.last_deployed = Some(head.to_string());
     state.last_deployed_at = Some(now());
 }

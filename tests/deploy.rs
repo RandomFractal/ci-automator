@@ -337,3 +337,65 @@ fn check_reports_problems() {
             .success()
     );
 }
+
+const FAIL_ON_BAD: &str = "case \"$2\" in bad) exit 3;; esac";
+
+#[test]
+fn failed_deploy_rolls_back_to_the_last_good_commit() {
+    let env = Env::new(FAIL_ON_BAD);
+    env.cia(&["--add-branch", "main"]);
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uv]\nrun = ['good']\n");
+    assert!(env.cia(&["--deploy"]).status.success());
+
+    env.push("DEPLOY.cia", "[uv]\nrun = ['bad']\n");
+    let out = env.cia(&["--deploy"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("rolled back to"), "{}", stderr(&out));
+    assert_eq!(env.uv_calls(), ["run good", "run bad", "run good"]);
+    assert!(
+        fs::read_to_string(env.path("host/DEPLOY.cia"))
+            .unwrap()
+            .contains("good")
+    );
+
+    let out = env.cia(&["--deploy"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("failed and was rolled back"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.uv_calls().len(), 3, "the failed commit is not retried");
+    let status = String::from_utf8_lossy(&env.cia(&["--status"]).stdout).into_owned();
+    assert!(status.contains("rolled back:"), "{status}");
+
+    let out = env.cia(&["--deploy", "--force"]);
+    assert!(!out.status.success());
+    assert_eq!(
+        env.uv_calls().len(),
+        5,
+        "--force retries it and rolls back again"
+    );
+
+    env.push("DEPLOY.cia", "[uv]\nrun = ['fixed']\n");
+    let out = env.cia(&["--deploy"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(env.uv_calls().last().unwrap(), "run fixed");
+    let status = String::from_utf8_lossy(&env.cia(&["--status"]).stdout).into_owned();
+    assert!(!status.contains("rolled back:"), "{status}");
+}
+
+#[test]
+fn rollback_can_be_turned_off() {
+    let env = Env::new(FAIL_ON_BAD);
+    env.cia(&["--add-branch", "main"]);
+    assert!(env.cia(&["--rollback", "off"]).status.success());
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uv]\nrun = ['good']\n");
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uv]\nrun = ['bad']\n");
+    assert!(!env.cia(&["--deploy"]).status.success());
+    assert!(!env.cia(&["--deploy"]).status.success());
+    assert_eq!(env.uv_calls(), ["run good", "run bad", "run bad"]);
+}

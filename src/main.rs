@@ -32,7 +32,7 @@ use crate::{
     about = "CI automations for hosts where hosted CI is not available"
 )]
 #[command(group(ArgGroup::new("action").required(true).args([
-    "add_branch", "rm_branch", "reset_branches", "interval", "show_config",
+    "add_branch", "rm_branch", "reset_branches", "interval", "rollback", "show_config",
     "check", "deploy", "watch", "status", "log", "install_service", "uninstall_service",
 ])))]
 struct Cli {
@@ -51,6 +51,10 @@ struct Cli {
     /// How often --watch runs automations, e.g. 30s, 5m, 2h, 1d
     #[arg(long, value_name = "NN{s|m|h|d}", value_parser = interval::parse)]
     interval: Option<Interval>,
+
+    /// Roll back to the last good commit when a deploy fails (default on)
+    #[arg(long, value_name = "on|off", value_parser = parse_on_off)]
+    rollback: Option<bool>,
 
     /// Show the global, repo and effective config
     #[arg(long)]
@@ -140,6 +144,11 @@ fn run(cli: Cli) -> Result<bool> {
         edit_config(cli.global, |cfg| {
             cfg.interval = Some(interval);
             Some(format!("interval set to {interval}"))
+        })?;
+    } else if let Some(on) = cli.rollback {
+        edit_config(cli.global, |cfg| {
+            cfg.rollback = Some(on);
+            Some(format!("rollback {}", on_off(on)))
         })?;
     } else if cli.show_config {
         show_config()?;
@@ -241,6 +250,7 @@ fn show_config() -> Result<()> {
             "  interval: {}",
             cfg.interval.map_or("-".into(), |i| i.to_string())
         );
+        println!("  rollback: {}", cfg.rollback.map_or("-", on_off));
     };
     let global_path = config::global_path()?;
     print("global", &global_path, &Config::load(&global_path)?);
@@ -254,6 +264,7 @@ fn show_config() -> Result<()> {
     println!("effective");
     println!("  branches: {}", list(&eff.branches));
     println!("  interval: {}", eff.interval);
+    println!("  rollback: {}", on_off(eff.rollback));
     Ok(())
 }
 
@@ -280,6 +291,12 @@ fn status(repo: &Repo) -> Result<()> {
     );
     if let Some(err) = &state.last_error {
         println!("last error:    {err}");
+    }
+    if let Some(sha) = &state.last_failed {
+        println!(
+            "rolled back:   from {}; it is skipped until upstream moves",
+            short(sha)
+        );
     }
     match (&state.last_deployed, &state.last_deployed_at) {
         (Some(sha), at) => println!("last deployed: {} at {}", short(sha), or_never(at)),
@@ -393,6 +410,18 @@ fn find_program(root: &Path, program: &str) -> Program {
     } else {
         Program::NotOnPath
     }
+}
+
+fn parse_on_off(s: &str) -> Result<bool, String> {
+    match s {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err("expected on or off".into()),
+    }
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
 }
 
 fn list(items: &[String]) -> String {

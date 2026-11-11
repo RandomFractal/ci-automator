@@ -36,6 +36,7 @@ cia --install-service        # start a systemd service that runs --watch for thi
 |---|---|
 | `--add-branch <name>` / `--rm-branch <name>` / `--reset-branches` | Manage target branches |
 | `--interval <NN{s\|m\|h\|d}>` | Set how often `--watch` runs (default `5m`) |
+| `--rollback <on\|off>` | Roll back to the last good commit when a deploy fails (default `on`) |
 | `--show-config` | Show the global, repo and effective config |
 | `--check [FILE]` | Check the config and `DEPLOY.cia` (or FILE), and that every step's program is on `PATH`; exits non-zero on errors |
 | `--deploy [--force] [--dry-run]` | Run one deploy check |
@@ -59,7 +60,9 @@ Branches from both files are combined, and a repo interval overrides the global 
 2. It fetches, then pulls with `--ff-only` if upstream has new commits. It refuses to pull if the branch has diverged, has local commits, has uncommitted changes to tracked files, or if `DEPLOY.cia` at the new commit is invalid, so a typo leaves the clone on the working commit.
 3. It reads `DEPLOY.cia` from the repo root and runs its steps in order from the root, stopping at the first failure.
 
-Steps run only when HEAD differs from the last commit deployed successfully. A failed deploy is therefore retried on the next run. `--force` runs the steps anyway.
+Steps run only when HEAD differs from the last commit deployed successfully. `--force` runs the steps anyway.
+
+If a step fails or times out, cia rolls back: it resets the clone to the last commit that deployed successfully (`git reset --hard`) and runs that commit's steps again. It then skips the failed commit until upstream moves past it or you run `--deploy --force`. Rollback restores the repo, not the app's data: anything a failed step changed outside the repo, such as a database migration, stays changed, and changes steps made to tracked files are discarded. Untracked and ignored files are kept. With no successful deploy to go back to, or with `cia --rollback off`, a failed deploy stays on the new commit and is retried on the next run.
 
 The first run in a clone that pulls nothing records HEAD as the deployed baseline without running anything. That way, installing the service does not restart an app that is already current.
 

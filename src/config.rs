@@ -17,6 +17,8 @@ pub struct Config {
     pub branches: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interval: Option<Interval>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<bool>,
 }
 
 impl Config {
@@ -42,6 +44,7 @@ impl Config {
 pub struct Effective {
     pub branches: Vec<String>,
     pub interval: Interval,
+    pub rollback: bool,
 }
 
 pub fn effective(repo: &Repo) -> Result<Effective> {
@@ -59,6 +62,7 @@ pub fn effective(repo: &Repo) -> Result<Effective> {
             .interval
             .or(global.interval)
             .unwrap_or(DEFAULT_INTERVAL),
+        rollback: local.rollback.or(global.rollback).unwrap_or(true),
     })
 }
 
@@ -91,11 +95,13 @@ mod tests {
         let cfg = Config {
             branches: vec!["main".into(), "staging".into()],
             interval: Some(Interval::new(30, 's')),
+            rollback: Some(false),
         };
         let text = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.branches, cfg.branches);
         assert_eq!(back.interval, cfg.interval);
+        assert_eq!(back.rollback, cfg.rollback);
     }
 
     #[test]
