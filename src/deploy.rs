@@ -6,6 +6,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -18,8 +19,9 @@ use crate::{
     config,
     git::{Repo, short},
     interval::Interval,
-    log::{Logger, now},
+    log::{DEPLOY_START, Logger, now},
     state::State,
+    webhook,
 };
 
 pub const DEPLOY_FILE: &str = "DEPLOY.cia";
@@ -34,38 +36,53 @@ struct Section {
     timeout: Option<Interval>,
 }
 
-struct Step {
-    program: String,
-    args: Vec<String>,
-    timeout: Interval,
+pub struct Step {
+    pub program: String,
+    pub args: Vec<String>,
+    pub timeout: Interval,
 }
 
 impl Step {
-    fn display(&self) -> String {
+    pub fn display(&self) -> String {
         shell_words::join(std::iter::once(&self.program).chain(&self.args))
     }
 }
 
-/// Sections run in the order they appear in the file.
-fn parse_steps(text: &str) -> Result<Vec<Step>> {
+/// Sections run in the order they appear in the file. Every problem is reported, not just the first.
+pub fn parse_steps(text: &str) -> Result<Vec<Step>> {
     let table: toml::Table =
         toml::from_str(text).with_context(|| format!("invalid {DEPLOY_FILE}"))?;
     let mut steps = Vec::new();
+    let mut errors = Vec::new();
     for (name, value) in table {
         let prefix: &[&str] = match name.as_str() {
             "uv" => &["uv", "run"],
             "run" => &[],
-            _ => bail!("unknown section [{name}] in {DEPLOY_FILE}"),
+            _ => {
+                errors.push(format!("unknown section [{name}]"));
+                continue;
+            }
         };
-        let section = Section::deserialize(value)
-            .with_context(|| format!("invalid [{name}] section in {DEPLOY_FILE}"))?;
+        let section = match Section::deserialize(value) {
+            Ok(section) => section,
+            Err(e) => {
+                errors.push(format!("invalid [{name}] section: {}", e.message()));
+                continue;
+            }
+        };
         let timeout = section.timeout.unwrap_or(DEFAULT_TIMEOUT);
         for entry in &section.run {
-            let words = shell_words::split(entry)
-                .with_context(|| format!("invalid [{name}] run entry {entry:?}"))?;
-            if words.is_empty() {
-                bail!("empty [{name}] run entry in {DEPLOY_FILE}");
-            }
+            let words = match shell_words::split(entry) {
+                Ok(words) if words.is_empty() => {
+                    errors.push(format!("empty [{name}] run entry"));
+                    continue;
+                }
+                Ok(words) => words,
+                Err(e) => {
+                    errors.push(format!("invalid [{name}] run entry {entry:?}: {e}"));
+                    continue;
+                }
+            };
             let mut words = prefix.iter().map(|w| w.to_string()).chain(words);
             steps.push(Step {
                 program: words.next().unwrap_or_default(),
@@ -73,6 +90,9 @@ fn parse_steps(text: &str) -> Result<Vec<Step>> {
                 timeout,
             });
         }
+    }
+    if !errors.is_empty() {
+        bail!("invalid {DEPLOY_FILE}: {}", errors.join("; "));
     }
     Ok(steps)
 }
@@ -138,10 +158,23 @@ pub fn deploy(repo: &Repo, opts: Options) -> Result<bool> {
 
 pub fn watch(repo: &Repo) -> Result<()> {
     let log = Logger::new(repo);
-    let mut interval = config::effective(repo)?.interval;
+    let cfg = config::effective(repo)?;
+    let mut interval = cfg.interval;
+    let (wake_tx, wake) = mpsc::channel();
+    if let Some(addr) = &cfg.webhook {
+        webhook::listen(
+            addr,
+            webhook::load_secret(repo)?,
+            log.clone(),
+            wake_tx.clone(),
+        )?;
+    }
     log.event(&format!(
-        "watch started (pid {}, every {interval})",
-        process::id()
+        "watch started (pid {}, every {interval}{})",
+        process::id(),
+        cfg.webhook
+            .as_ref()
+            .map_or(String::new(), |a| format!(", webhook on {a}"))
     ));
     loop {
         if let Err(e) = deploy(repo, Options::default()) {
@@ -160,7 +193,11 @@ pub fn watch(repo: &Repo) -> Result<()> {
                 "cannot reload config, keeping interval {interval}: {e:#}"
             )),
         }
-        thread::sleep(interval.duration());
+        if wake.recv_timeout(interval.duration()).is_ok() {
+            // Several pushes in a row need only one check.
+            while wake.try_recv().is_ok() {}
+            log.info("woken by a webhook push");
+        }
     }
 }
 
@@ -168,8 +205,8 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     let Some(branch) = repo.branch()? else {
         return Ok(skip(log, "skipped: HEAD is detached"));
     };
-    let targets = config::effective(repo)?.branches;
-    if !targets.contains(&branch) {
+    let cfg = config::effective(repo)?;
+    if !cfg.branches.contains(&branch) {
         return Ok(skip(
             log,
             &format!("skipped: {branch} is not a target branch"),
@@ -179,9 +216,24 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     repo.git(&["fetch", "--quiet"])?;
     let before = repo.git(&["rev-parse", "HEAD"])?;
     let remote = repo.git(&["rev-parse", "@{u}"])?;
+    if !force && state.last_failed.as_deref() == Some(remote.as_str()) {
+        bail!(
+            "{upstream} is still at {}, which failed and was rolled back; \
+             push a fix or use cia --deploy --force",
+            short(&remote)
+        );
+    }
     let pulled = before != remote;
     if pulled {
         ensure_fast_forward(repo, &branch, &upstream, &before, &remote)?;
+        if let Some(text) = repo.read_file_at(&remote, DEPLOY_FILE)? {
+            parse_steps(&text).with_context(|| {
+                format!(
+                    "{DEPLOY_FILE} at {} is invalid; refusing to pull",
+                    short(&remote)
+                )
+            })?;
+        }
         repo.git(&["pull", "--ff-only", "--quiet"])?;
     }
     let head = repo.git(&["rev-parse", "HEAD"])?;
@@ -212,10 +264,13 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
         Decision::Run => {}
     }
 
-    let steps = match fs::read_to_string(repo.root.join(DEPLOY_FILE)) {
-        Ok(text) => parse_steps(&text)?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(e).with_context(|| format!("cannot read {DEPLOY_FILE}")),
+    let good = state
+        .last_deployed
+        .clone()
+        .filter(|good| cfg.rollback && *good != head);
+    let steps = match read_steps(repo) {
+        Ok(steps) => steps,
+        Err(e) => return Err(roll_back(repo, log, state, &head, good, false, e)),
     };
     if steps.is_empty() {
         log.event(&format!(
@@ -227,14 +282,14 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     }
 
     log.event(&format!(
-        "deploying {branch} at {}{}",
+        "{DEPLOY_START}{branch} at {}{}",
         short(&head),
         if force { " (forced)" } else { "" }
     ));
     state.last_attempted = Some(head.clone());
     let started = Instant::now();
-    for step in &steps {
-        run_step(repo, log, step)?;
+    if let Err(e) = steps.iter().try_for_each(|step| run_step(repo, log, step)) {
+        return Err(roll_back(repo, log, state, &head, good, true, e));
     }
     log.event(&format!(
         "deployed {branch} at {} in {}",
@@ -245,13 +300,60 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     Ok(format!("deployed {}", short(&head)))
 }
 
+fn read_steps(repo: &Repo) -> Result<Vec<Step>> {
+    match fs::read_to_string(repo.root.join(DEPLOY_FILE)) {
+        Ok(text) => parse_steps(&text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {DEPLOY_FILE}")),
+    }
+}
+
+/// Resets to the last good commit and re-runs its steps, unless no step ran.
+/// Returns the deploy error with the rollback's outcome added.
+fn roll_back(
+    repo: &Repo,
+    log: &Logger,
+    state: &mut State,
+    failed: &str,
+    good: Option<String>,
+    steps_ran: bool,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let Some(good) = good else {
+        return err;
+    };
+    log.event(&format!(
+        "{err:#}; rolling back from {} to {}",
+        short(failed),
+        short(&good)
+    ));
+    state.last_failed = Some(failed.to_string());
+    let result = repo
+        .git(&["reset", "--hard", "--quiet", &good])
+        .and_then(|_| {
+            if steps_ran {
+                read_steps(repo)?
+                    .iter()
+                    .try_for_each(|step| run_step(repo, log, step))?;
+            }
+            Ok(())
+        });
+    match result {
+        Ok(()) => {
+            log.event(&format!("rolled back to {}", short(&good)));
+            anyhow::anyhow!("{err:#}; rolled back to {}", short(&good))
+        }
+        Err(e) => anyhow::anyhow!("{err:#}; rollback to {} failed: {e:#}", short(&good)),
+    }
+}
+
 fn dry_run(repo: &Repo, force: bool) -> Result<()> {
     let Some(branch) = repo.branch()? else {
         println!("HEAD is detached; nothing would run");
         return Ok(());
     };
-    let targets = config::effective(repo)?.branches;
-    if !targets.contains(&branch) {
+    let cfg = config::effective(repo)?;
+    if !cfg.branches.contains(&branch) {
         println!("{branch} is not a target branch; nothing would run");
         return Ok(());
     }
@@ -259,6 +361,14 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
     repo.git(&["fetch", "--quiet"])?;
     let head = repo.git(&["rev-parse", "HEAD"])?;
     let remote = repo.git(&["rev-parse", "@{u}"])?;
+    let state = State::load(repo)?;
+    if !force && state.last_failed.as_deref() == Some(remote.as_str()) {
+        println!(
+            "{upstream} is still at {}, which failed and was rolled back; nothing would run (use --force)",
+            short(&remote)
+        );
+        return Ok(());
+    }
     let pulled = head != remote;
     if pulled {
         ensure_fast_forward(repo, &branch, &upstream, &head, &remote)?;
@@ -274,23 +384,23 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
         println!("{branch} is up to date with {upstream}");
     }
 
-    match decide(&State::load(repo)?, &remote, pulled, force) {
+    let will_run = match decide(&state, &remote, pulled, force) {
         Decision::AlreadyDeployed => {
             println!(
                 "{} is already deployed; nothing would run (use --force)",
                 short(&remote)
             );
-            return Ok(());
+            false
         }
         Decision::RecordBaseline => {
             println!(
                 "no deploy recorded yet; would record {} as the baseline without running anything",
                 short(&remote)
             );
-            return Ok(());
+            false
         }
-        Decision::Run => {}
-    }
+        Decision::Run => true,
+    };
 
     let text = if pulled {
         repo.read_file_at(&remote, DEPLOY_FILE)?
@@ -308,8 +418,23 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
     if steps.is_empty() {
         println!("{DEPLOY_FILE} defines nothing to run");
     }
+    let label = if will_run {
+        "would run"
+    } else {
+        "would not run"
+    };
     for step in &steps {
-        println!("would run: {} (timeout {})", step.display(), step.timeout);
+        println!("{label}: {} (timeout {})", step.display(), step.timeout);
+    }
+    if !will_run {
+        return Ok(());
+    }
+    if let Some(good) = state
+        .last_deployed
+        .as_deref()
+        .filter(|g| cfg.rollback && *g != remote)
+    {
+        println!("if a step fails, would roll back to {}", short(good));
     }
     Ok(())
 }
@@ -320,6 +445,7 @@ fn skip(log: &Logger, msg: &str) -> String {
 }
 
 fn mark_deployed(state: &mut State, head: &str) {
+    state.last_failed = None;
     state.last_deployed = Some(head.to_string());
     state.last_deployed_at = Some(now());
 }
@@ -529,6 +655,17 @@ mod tests {
         assert!(parse_steps("[uv]\nrun = ['']\n").is_err());
         assert!(parse_steps("[run]\nrun = ['  ']\n").is_err());
         assert!(parse_steps("uv = 'x'\n").is_err());
+    }
+
+    #[test]
+    fn reports_every_problem() {
+        let err = parse_steps("[uvv]\nrun = ['x']\n[run]\nrun = ['ok', '', 'a \"b']\n")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("unknown section [uvv]"), "{err}");
+        assert!(err.contains("empty [run] run entry"), "{err}");
+        assert!(err.contains("invalid [run] run entry"), "{err}");
     }
 
     #[test]

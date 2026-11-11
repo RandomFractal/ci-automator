@@ -19,6 +19,9 @@ pub struct State {
     pub last_deployed: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_deployed_at: Option<String>,
+    /// A commit that failed and was rolled back; not retried until upstream moves or --force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failed: Option<String>,
 }
 
 impl State {

@@ -238,6 +238,16 @@ fn dry_run_changes_nothing() {
     );
     assert!(!env.path("host/DEPLOY.cia").exists());
     assert!(env.uv_calls().is_empty());
+
+    env.cia(&["--deploy"]);
+    let out = env.cia(&["--deploy", "--dry-run"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("already deployed"), "{stdout}");
+    assert!(
+        stdout.contains("would not run: uv run fast restart"),
+        "{stdout}"
+    );
+    assert_eq!(env.uv_calls().len(), 1);
 }
 
 #[test]
@@ -280,4 +290,235 @@ fn runs_run_and_uv_sections_in_file_order() {
     let out = env.cia(&["--deploy"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(env.uv_calls(), ["build", "run fast restart"]);
+}
+
+#[test]
+fn refuses_to_pull_an_invalid_deploy_file() {
+    let env = Env::new("");
+    env.cia(&["--add-branch", "main"]);
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uvv]\nrun = ['app']\n");
+    let out = env.cia(&["--deploy"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("refusing to pull"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!env.path("host/DEPLOY.cia").exists(), "must not pull");
+    assert!(env.uv_calls().is_empty());
+}
+
+#[test]
+fn check_reports_problems() {
+    let env = Env::new("");
+    env.cia(&["--add-branch", "main"]);
+    env.push(
+        "DEPLOY.cia",
+        "[run]\nrun = ['no-such-program-xyz', './build/app']\n[uv]\nrun = ['app']\n",
+    );
+    env.cia(&["--deploy"]);
+    let out = env.cia(&["--check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("error: no-such-program-xyz is not on PATH"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("warning: ./build/app does not exist yet"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("ok: uv run app"), "{stdout}");
+    assert!(stdout.contains("upstream origin/main"), "{stdout}");
+
+    fs::write(env.path("good.cia"), "[uv]\nrun = ['app']\n").unwrap();
+    let good = env.path("good.cia");
+    assert!(
+        env.cia(&["--check", good.to_str().unwrap()])
+            .status
+            .success()
+    );
+    fs::write(env.path("bad.cia"), "[uv]\nruns = ['app']\n").unwrap();
+    let bad = env.path("bad.cia");
+    assert!(
+        !env.cia(&["--check", bad.to_str().unwrap()])
+            .status
+            .success()
+    );
+}
+
+const FAIL_ON_BAD: &str = "case \"$2\" in bad) exit 3;; esac";
+
+#[test]
+fn failed_deploy_rolls_back_to_the_last_good_commit() {
+    let env = Env::new(FAIL_ON_BAD);
+    env.cia(&["--add-branch", "main"]);
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uv]\nrun = ['good']\n");
+    assert!(env.cia(&["--deploy"]).status.success());
+
+    env.push("DEPLOY.cia", "[uv]\nrun = ['bad']\n");
+    let out = env.cia(&["--deploy"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("rolled back to"), "{}", stderr(&out));
+    assert_eq!(env.uv_calls(), ["run good", "run bad", "run good"]);
+    assert!(
+        fs::read_to_string(env.path("host/DEPLOY.cia"))
+            .unwrap()
+            .contains("good")
+    );
+
+    let out = env.cia(&["--deploy"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("failed and was rolled back"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.uv_calls().len(), 3, "the failed commit is not retried");
+    let status = String::from_utf8_lossy(&env.cia(&["--status"]).stdout).into_owned();
+    assert!(status.contains("rolled back:"), "{status}");
+
+    let out = env.cia(&["--deploy", "--force"]);
+    assert!(!out.status.success());
+    assert_eq!(
+        env.uv_calls().len(),
+        5,
+        "--force retries it and rolls back again"
+    );
+
+    env.push("DEPLOY.cia", "[uv]\nrun = ['fixed']\n");
+    let out = env.cia(&["--deploy"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(env.uv_calls().last().unwrap(), "run fixed");
+    let status = String::from_utf8_lossy(&env.cia(&["--status"]).stdout).into_owned();
+    assert!(!status.contains("rolled back:"), "{status}");
+}
+
+#[test]
+fn rollback_can_be_turned_off() {
+    let env = Env::new(FAIL_ON_BAD);
+    env.cia(&["--add-branch", "main"]);
+    assert!(env.cia(&["--rollback", "off"]).status.success());
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uv]\nrun = ['good']\n");
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uv]\nrun = ['bad']\n");
+    assert!(!env.cia(&["--deploy"]).status.success());
+    assert!(!env.cia(&["--deploy"]).status.success());
+    assert_eq!(env.uv_calls(), ["run good", "run bad", "run bad"]);
+}
+
+#[test]
+fn log_last_shows_only_the_last_deploy() {
+    let env = Env::new("echo \"output of $2\"");
+    env.cia(&["--add-branch", "main"]);
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uv]\nrun = ['first']\n");
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uv]\nrun = ['second']\n");
+    env.cia(&["--deploy"]);
+    let out = env.cia(&["--log", "--last"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(stdout.contains("output of second"), "{stdout}");
+    assert!(!stdout.contains("output of first"), "{stdout}");
+}
+
+struct Watch(std::process::Child);
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn post(addr: &str, event: &str, signature: &str, body: &str) -> String {
+    use std::io::{Read, Write};
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    let mut stream = loop {
+        match std::net::TcpStream::connect(addr) {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            Err(e) => panic!("cannot connect to {addr}: {e}"),
+        }
+    };
+    write!(
+        stream,
+        "POST /hook HTTP/1.1\r\nX-GitHub-Event: {event}\r\nX-Hub-Signature-256: {signature}\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+fn sign(secret: &str, body: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    format!(
+        "sha256={}",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
+}
+
+#[test]
+fn signed_push_webhook_triggers_a_deploy() {
+    let env = Env::new("");
+    env.cia(&["--add-branch", "main"]);
+    env.cia(&["--interval", "1h"]);
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let addr = format!("127.0.0.1:{port}");
+    let out = env.cia(&["--webhook", &addr]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let secret = fs::read_to_string(env.path("host/.git/cia/webhook-secret")).unwrap();
+    let mode = fs::metadata(env.path("host/.git/cia/webhook-secret"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&secret));
+
+    let _watch = Watch(
+        env.command(env!("CARGO_BIN_EXE_cia"), &env.path("host"))
+            .arg("--watch")
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while !env.log("events.log").contains("deployed baseline") && Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let body = r#"{"ref":"refs/heads/main"}"#;
+    assert!(post(&addr, "ping", &sign(&secret, body), body).starts_with("HTTP/1.1 200"));
+    env.push("DEPLOY.cia", "[uv]\nrun = ['app']\n");
+    assert!(post(&addr, "push", &sign("wrong", body), body).starts_with("HTTP/1.1 401"));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        env.uv_calls().is_empty(),
+        "an unsigned push must not deploy"
+    );
+
+    assert!(post(&addr, "push", &sign(&secret, body), body).starts_with("HTTP/1.1 202"));
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while env.uv_calls().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(env.uv_calls(), ["run app"]);
+
+    assert!(env.cia(&["--webhook", "off"]).status.success());
+    assert!(!env.cia(&["--webhook", "nonsense"]).status.success());
 }
