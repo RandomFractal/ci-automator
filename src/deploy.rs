@@ -6,6 +6,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -20,6 +21,7 @@ use crate::{
     interval::Interval,
     log::{DEPLOY_START, Logger, now},
     state::State,
+    webhook,
 };
 
 pub const DEPLOY_FILE: &str = "DEPLOY.cia";
@@ -156,10 +158,23 @@ pub fn deploy(repo: &Repo, opts: Options) -> Result<bool> {
 
 pub fn watch(repo: &Repo) -> Result<()> {
     let log = Logger::new(repo);
-    let mut interval = config::effective(repo)?.interval;
+    let cfg = config::effective(repo)?;
+    let mut interval = cfg.interval;
+    let (wake_tx, wake) = mpsc::channel();
+    if let Some(addr) = &cfg.webhook {
+        webhook::listen(
+            addr,
+            webhook::load_secret(repo)?,
+            log.clone(),
+            wake_tx.clone(),
+        )?;
+    }
     log.event(&format!(
-        "watch started (pid {}, every {interval})",
-        process::id()
+        "watch started (pid {}, every {interval}{})",
+        process::id(),
+        cfg.webhook
+            .as_ref()
+            .map_or(String::new(), |a| format!(", webhook on {a}"))
     ));
     loop {
         if let Err(e) = deploy(repo, Options::default()) {
@@ -178,7 +193,11 @@ pub fn watch(repo: &Repo) -> Result<()> {
                 "cannot reload config, keeping interval {interval}: {e:#}"
             )),
         }
-        thread::sleep(interval.duration());
+        if wake.recv_timeout(interval.duration()).is_ok() {
+            // Several pushes in a row need only one check.
+            while wake.try_recv().is_ok() {}
+            log.info("woken by a webhook push");
+        }
     }
 }
 

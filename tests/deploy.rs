@@ -425,3 +425,100 @@ fn log_last_shows_only_the_last_deploy() {
     assert!(stdout.contains("output of second"), "{stdout}");
     assert!(!stdout.contains("output of first"), "{stdout}");
 }
+
+struct Watch(std::process::Child);
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn post(addr: &str, event: &str, signature: &str, body: &str) -> String {
+    use std::io::{Read, Write};
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    let mut stream = loop {
+        match std::net::TcpStream::connect(addr) {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            Err(e) => panic!("cannot connect to {addr}: {e}"),
+        }
+    };
+    write!(
+        stream,
+        "POST /hook HTTP/1.1\r\nX-GitHub-Event: {event}\r\nX-Hub-Signature-256: {signature}\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+fn sign(secret: &str, body: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    format!(
+        "sha256={}",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
+}
+
+#[test]
+fn signed_push_webhook_triggers_a_deploy() {
+    let env = Env::new("");
+    env.cia(&["--add-branch", "main"]);
+    env.cia(&["--interval", "1h"]);
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let addr = format!("127.0.0.1:{port}");
+    let out = env.cia(&["--webhook", &addr]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let secret = fs::read_to_string(env.path("host/.git/cia/webhook-secret")).unwrap();
+    let mode = fs::metadata(env.path("host/.git/cia/webhook-secret"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&secret));
+
+    let _watch = Watch(
+        env.command(env!("CARGO_BIN_EXE_cia"), &env.path("host"))
+            .arg("--watch")
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while !env.log("events.log").contains("deployed baseline") && Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let body = r#"{"ref":"refs/heads/main"}"#;
+    assert!(post(&addr, "ping", &sign(&secret, body), body).starts_with("HTTP/1.1 200"));
+    env.push("DEPLOY.cia", "[uv]\nrun = ['app']\n");
+    assert!(post(&addr, "push", &sign("wrong", body), body).starts_with("HTTP/1.1 401"));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        env.uv_calls().is_empty(),
+        "an unsigned push must not deploy"
+    );
+
+    assert!(post(&addr, "push", &sign(&secret, body), body).starts_with("HTTP/1.1 202"));
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while env.uv_calls().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(env.uv_calls(), ["run app"]);
+
+    assert!(env.cia(&["--webhook", "off"]).status.success());
+    assert!(!env.cia(&["--webhook", "nonsense"]).status.success());
+}

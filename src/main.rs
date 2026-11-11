@@ -5,6 +5,7 @@ mod interval;
 mod log;
 mod service;
 mod state;
+mod webhook;
 
 use std::{
     env, fs,
@@ -32,7 +33,7 @@ use crate::{
     about = "CI automations for hosts where hosted CI is not available"
 )]
 #[command(group(ArgGroup::new("action").required(true).args([
-    "add_branch", "rm_branch", "reset_branches", "interval", "rollback", "show_config",
+    "add_branch", "rm_branch", "reset_branches", "interval", "rollback", "webhook", "show_config",
     "check", "deploy", "watch", "status", "log", "install_service", "uninstall_service",
 ])))]
 struct Cli {
@@ -55,6 +56,10 @@ struct Cli {
     /// Roll back to the last good commit when a deploy fails (default on)
     #[arg(long, value_name = "on|off", value_parser = parse_on_off)]
     rollback: Option<bool>,
+
+    /// Listen for GitHub push webhooks on ADDR (e.g. 127.0.0.1:9000) in --watch, or "off"
+    #[arg(long, value_name = "ADDR|off", conflicts_with = "global")]
+    webhook: Option<String>,
 
     /// Show the global, repo and effective config
     #[arg(long)]
@@ -154,6 +159,8 @@ fn run(cli: Cli) -> Result<bool> {
             cfg.rollback = Some(on);
             Some(format!("rollback {}", on_off(on)))
         })?;
+    } else if let Some(addr) = &cli.webhook {
+        set_webhook(addr)?;
     } else if cli.show_config {
         show_config()?;
     } else if let Some(file) = &cli.check {
@@ -252,6 +259,36 @@ fn edit_config(global: bool, change: impl FnOnce(&mut Config) -> Option<String>)
     Ok(())
 }
 
+fn set_webhook(addr: &str) -> Result<()> {
+    if addr == "off" {
+        return edit_config(false, |cfg| {
+            cfg.webhook.take().map(|_| "webhook off".to_string())
+        });
+    }
+    if addr.parse::<std::net::SocketAddr>().is_err() {
+        bail!("'{addr}' is not an address like 127.0.0.1:9000");
+    }
+    edit_config(false, |cfg| {
+        cfg.webhook = Some(addr.to_string());
+        Some(format!("webhook on {addr}"))
+    })?;
+    let repo = Repo::discover()?;
+    let (secret, created) = webhook::ensure_secret(&repo)?;
+    if created {
+        println!(
+            "created the webhook secret {}",
+            webhook::secret_path(&repo).display()
+        );
+    }
+    println!(
+        "In GitHub, add a webhook under Settings > Webhooks with content type application/json, \
+         the push event, and this secret:\n  {secret}\n\
+         Point it at a public URL that forwards to {addr}, such as a reverse proxy or tunnel. \
+         Restart --watch or the service to start listening."
+    );
+    Ok(())
+}
+
 fn show_config() -> Result<()> {
     let print = |label: &str, path: &std::path::Path, cfg: &Config| {
         println!("{label} ({})", path.display());
@@ -261,6 +298,7 @@ fn show_config() -> Result<()> {
             cfg.interval.map_or("-".into(), |i| i.to_string())
         );
         println!("  rollback: {}", cfg.rollback.map_or("-", on_off));
+        println!("  webhook:  {}", cfg.webhook.as_deref().unwrap_or("-"));
     };
     let global_path = config::global_path()?;
     print("global", &global_path, &Config::load(&global_path)?);
@@ -275,6 +313,7 @@ fn show_config() -> Result<()> {
     println!("  branches: {}", list(&eff.branches));
     println!("  interval: {}", eff.interval);
     println!("  rollback: {}", on_off(eff.rollback));
+    println!("  webhook:  {}", eff.webhook.as_deref().unwrap_or("off"));
     Ok(())
 }
 
@@ -291,6 +330,9 @@ fn status(repo: &Repo) -> Result<()> {
     println!("branch:        {branch}");
     println!("targets:       {}", list(&eff.branches));
     println!("interval:      {}", eff.interval);
+    if let Some(addr) = &eff.webhook {
+        println!("webhook:       {addr} (while --watch runs)");
+    }
     println!(
         "last run:      {}{}",
         or_never(&state.last_run_at),
@@ -371,6 +413,12 @@ fn check(repo: &Repo, file: Option<&Path>) -> Result<bool> {
     }
 
     if let Ok(eff) = config::effective(repo) {
+        if let Some(addr) = &eff.webhook {
+            match webhook::load_secret(repo) {
+                Ok(_) => println!("webhook: {addr}"),
+                Err(e) => error(format!("{e:#}; run cia --webhook {addr} to create it")),
+            }
+        }
         match repo.branch()? {
             None => println!("warning: HEAD is detached; deploys will do nothing"),
             Some(b) if !eff.branches.contains(&b) => {

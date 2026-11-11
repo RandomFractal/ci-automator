@@ -37,6 +37,7 @@ cia --install-service        # start a systemd service that runs --watch for thi
 | `--add-branch <name>` / `--rm-branch <name>` / `--reset-branches` | Manage target branches |
 | `--interval <NN{s\|m\|h\|d}>` | Set how often `--watch` runs (default `5m`) |
 | `--rollback <on\|off>` | Roll back to the last good commit when a deploy fails (default `on`) |
+| `--webhook <ADDR\|off>` | Make `--watch` also deploy on signed GitHub push webhooks received on ADDR |
 | `--show-config` | Show the global, repo and effective config |
 | `--check [FILE]` | Check the config and `DEPLOY.cia` (or FILE), and that every step's program is on `PATH`; exits non-zero on errors |
 | `--deploy [--force] [--dry-run]` | Run one deploy check |
@@ -82,6 +83,20 @@ run = ['fast restart']   # runs: uv run fast restart
 `[run]` entries run as given. `[uv]` entries run with `uv run` in front. Sections run in the order they appear in the file, and each section's entries run in order. Each entry is split like a shell command, so quotes group words, and it runs directly, never through a shell. When a step exceeds its timeout, cia kills it and every process it started. Unknown sections or keys are an error. Run `cia --check` to see every problem at once, or `cia --check path/to/DEPLOY.cia` to check a file before committing it.
 
 A step may leave a server running in the background. cia stops recording the server's output a couple of seconds after the step exits.
+
+## Webhooks
+
+By default `--watch` polls every interval. To deploy as soon as you push, have GitHub send a push webhook:
+
+```bash
+cia --webhook 127.0.0.1:9000
+```
+
+This saves the address in the repo config, creates a random secret in `.git/cia/webhook-secret` (readable only by you), and prints the secret. In the GitHub repo, add a webhook under Settings > Webhooks with content type `application/json`, the push event only, and that secret. Restart `--watch` or the service to start listening.
+
+cia checks every request's `X-Hub-Signature-256` HMAC against the secret and ignores anything unsigned or wrongly signed. A valid push starts a deploy check right away; the deploy itself still decides whether there is anything to pull, so pushes to other branches do nothing. Polling carries on as a fallback, so a missed webhook only delays a deploy until the next interval.
+
+cia speaks plain HTTP, so don't expose the port directly: bind it to `127.0.0.1` and put a reverse proxy with TLS or a tunnel (for example Tailscale Funnel or cloudflared) in front of it. `cia --webhook off` turns it off.
 
 ## Logs
 
