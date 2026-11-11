@@ -37,6 +37,7 @@ cia --install-service        # start a systemd service that runs --watch for thi
 | `--add-branch <name>` / `--rm-branch <name>` / `--reset-branches` | Manage target branches |
 | `--interval <NN{s\|m\|h\|d}>` | Set how often `--watch` runs (default `5m`) |
 | `--show-config` | Show the global, repo and effective config |
+| `--check [FILE]` | Check the config and `DEPLOY.cia` (or FILE), and that every step's program is on `PATH`; exits non-zero on errors |
 | `--deploy [--force] [--dry-run]` | Run one deploy check |
 | `--watch` | Run `--deploy` every interval, re-reading the config each time |
 | `--status` | Show the last run, last deploy, any error, and service state |
@@ -55,7 +56,7 @@ Branches from both files are combined, and a repo interval overrides the global 
 ## `--deploy`
 
 1. If the current branch is not a target branch, or HEAD is detached, it does nothing.
-2. It fetches, then pulls with `--ff-only` if upstream has new commits. It refuses to pull if the branch has diverged, has local commits, or has uncommitted changes to tracked files.
+2. It fetches, then pulls with `--ff-only` if upstream has new commits. It refuses to pull if the branch has diverged, has local commits, has uncommitted changes to tracked files, or if `DEPLOY.cia` at the new commit is invalid, so a typo leaves the clone on the working commit.
 3. It reads `DEPLOY.cia` from the repo root and runs its steps in order from the root, stopping at the first failure.
 
 Steps run only when HEAD differs from the last commit deployed successfully. A failed deploy is therefore retried on the next run. `--force` runs the steps anyway.
@@ -75,7 +76,7 @@ timeout = '10m'          # optional, per step; default 10m
 run = ['fast restart']   # runs: uv run fast restart
 ```
 
-`[run]` entries run as given. `[uv]` entries run with `uv run` in front. Sections run in the order they appear in the file, and each section's entries run in order. Each entry is split like a shell command, so quotes group words, and it runs directly, never through a shell. When a step exceeds its timeout, cia kills it and every process it started. Unknown sections or keys are an error.
+`[run]` entries run as given. `[uv]` entries run with `uv run` in front. Sections run in the order they appear in the file, and each section's entries run in order. Each entry is split like a shell command, so quotes group words, and it runs directly, never through a shell. When a step exceeds its timeout, cia kills it and every process it started. Unknown sections or keys are an error. Run `cia --check` to see every problem at once, or `cia --check path/to/DEPLOY.cia` to check a file before committing it.
 
 A step may leave a server running in the background. cia stops recording the server's output a couple of seconds after the step exits.
 

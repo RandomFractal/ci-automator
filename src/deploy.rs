@@ -34,38 +34,53 @@ struct Section {
     timeout: Option<Interval>,
 }
 
-struct Step {
-    program: String,
-    args: Vec<String>,
-    timeout: Interval,
+pub struct Step {
+    pub program: String,
+    pub args: Vec<String>,
+    pub timeout: Interval,
 }
 
 impl Step {
-    fn display(&self) -> String {
+    pub fn display(&self) -> String {
         shell_words::join(std::iter::once(&self.program).chain(&self.args))
     }
 }
 
-/// Sections run in the order they appear in the file.
-fn parse_steps(text: &str) -> Result<Vec<Step>> {
+/// Sections run in the order they appear in the file. Every problem is reported, not just the first.
+pub fn parse_steps(text: &str) -> Result<Vec<Step>> {
     let table: toml::Table =
         toml::from_str(text).with_context(|| format!("invalid {DEPLOY_FILE}"))?;
     let mut steps = Vec::new();
+    let mut errors = Vec::new();
     for (name, value) in table {
         let prefix: &[&str] = match name.as_str() {
             "uv" => &["uv", "run"],
             "run" => &[],
-            _ => bail!("unknown section [{name}] in {DEPLOY_FILE}"),
+            _ => {
+                errors.push(format!("unknown section [{name}]"));
+                continue;
+            }
         };
-        let section = Section::deserialize(value)
-            .with_context(|| format!("invalid [{name}] section in {DEPLOY_FILE}"))?;
+        let section = match Section::deserialize(value) {
+            Ok(section) => section,
+            Err(e) => {
+                errors.push(format!("invalid [{name}] section: {}", e.message()));
+                continue;
+            }
+        };
         let timeout = section.timeout.unwrap_or(DEFAULT_TIMEOUT);
         for entry in &section.run {
-            let words = shell_words::split(entry)
-                .with_context(|| format!("invalid [{name}] run entry {entry:?}"))?;
-            if words.is_empty() {
-                bail!("empty [{name}] run entry in {DEPLOY_FILE}");
-            }
+            let words = match shell_words::split(entry) {
+                Ok(words) if words.is_empty() => {
+                    errors.push(format!("empty [{name}] run entry"));
+                    continue;
+                }
+                Ok(words) => words,
+                Err(e) => {
+                    errors.push(format!("invalid [{name}] run entry {entry:?}: {e}"));
+                    continue;
+                }
+            };
             let mut words = prefix.iter().map(|w| w.to_string()).chain(words);
             steps.push(Step {
                 program: words.next().unwrap_or_default(),
@@ -73,6 +88,9 @@ fn parse_steps(text: &str) -> Result<Vec<Step>> {
                 timeout,
             });
         }
+    }
+    if !errors.is_empty() {
+        bail!("invalid {DEPLOY_FILE}: {}", errors.join("; "));
     }
     Ok(steps)
 }
@@ -182,6 +200,14 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     let pulled = before != remote;
     if pulled {
         ensure_fast_forward(repo, &branch, &upstream, &before, &remote)?;
+        if let Some(text) = repo.read_file_at(&remote, DEPLOY_FILE)? {
+            parse_steps(&text).with_context(|| {
+                format!(
+                    "{DEPLOY_FILE} at {} is invalid; refusing to pull",
+                    short(&remote)
+                )
+            })?;
+        }
         repo.git(&["pull", "--ff-only", "--quiet"])?;
     }
     let head = repo.git(&["rev-parse", "HEAD"])?;
@@ -529,6 +555,17 @@ mod tests {
         assert!(parse_steps("[uv]\nrun = ['']\n").is_err());
         assert!(parse_steps("[run]\nrun = ['  ']\n").is_err());
         assert!(parse_steps("uv = 'x'\n").is_err());
+    }
+
+    #[test]
+    fn reports_every_problem() {
+        let err = parse_steps("[uvv]\nrun = ['x']\n[run]\nrun = ['ok', '', 'a \"b']\n")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("unknown section [uvv]"), "{err}");
+        assert!(err.contains("empty [run] run entry"), "{err}");
+        assert!(err.contains("invalid [run] run entry"), "{err}");
     }
 
     #[test]

@@ -6,7 +6,12 @@ mod log;
 mod service;
 mod state;
 
-use std::process::ExitCode;
+use std::{
+    env, fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Parser};
@@ -28,7 +33,7 @@ use crate::{
 )]
 #[command(group(ArgGroup::new("action").required(true).args([
     "add_branch", "rm_branch", "reset_branches", "interval", "show_config",
-    "deploy", "watch", "status", "log", "install_service", "uninstall_service",
+    "check", "deploy", "watch", "status", "log", "install_service", "uninstall_service",
 ])))]
 struct Cli {
     /// Add a branch that automations apply to
@@ -50,6 +55,10 @@ struct Cli {
     /// Show the global, repo and effective config
     #[arg(long)]
     show_config: bool,
+
+    /// Check the config, DEPLOY.cia (or FILE) and that each step can run
+    #[arg(long, value_name = "FILE", num_args = 0..=1)]
+    check: Option<Option<PathBuf>>,
 
     /// Pull the current branch if it is a target and run DEPLOY.cia on changes
     #[arg(long)]
@@ -76,7 +85,7 @@ struct Cli {
     uninstall_service: bool,
 
     /// Use the global config, or the system-wide service, instead of this repo's
-    #[arg(long, conflicts_with_all = ["show_config", "deploy", "watch", "status", "log"])]
+    #[arg(long, conflicts_with_all = ["show_config", "check", "deploy", "watch", "status", "log"])]
     global: bool,
 
     /// With --deploy: run DEPLOY.cia even if this commit is already deployed
@@ -134,6 +143,8 @@ fn run(cli: Cli) -> Result<bool> {
         })?;
     } else if cli.show_config {
         show_config()?;
+    } else if let Some(file) = &cli.check {
+        return check(&Repo::discover()?, file.as_deref());
     } else if cli.deploy {
         let opts = deploy::Options {
             force: cli.force,
@@ -285,6 +296,103 @@ fn status(repo: &Repo) -> Result<()> {
     println!("events log:    {}", logger.events.display());
     println!("activity log:  {}", logger.activity.display());
     Ok(())
+}
+
+/// Prints every problem it finds; returns false if any of them would make a deploy fail.
+fn check(repo: &Repo, file: Option<&Path>) -> Result<bool> {
+    let mut errors = 0;
+    let mut error = |msg: String| {
+        println!("error: {msg}");
+        errors += 1;
+    };
+    for path in [config::global_path()?, config::repo_path(repo)] {
+        if let Err(e) = Config::load(&path) {
+            error(format!("{e:#}"));
+        }
+    }
+
+    let (path, required) = match file {
+        Some(f) => (f.to_path_buf(), true),
+        None => (repo.root.join(deploy::DEPLOY_FILE), false),
+    };
+    match fs::read_to_string(&path) {
+        Ok(text) => match deploy::parse_steps(&text) {
+            Ok(steps) => {
+                println!("{}: {} step(s)", path.display(), steps.len());
+                for step in &steps {
+                    match find_program(&repo.root, &step.program) {
+                        Program::Found => println!("  ok: {}", step.display()),
+                        Program::MissingPath => println!(
+                            "  warning: {} does not exist yet; fine if an earlier step creates it",
+                            step.program
+                        ),
+                        Program::NotOnPath => error(format!(
+                            "{} is not on PATH ({})",
+                            step.program,
+                            step.display()
+                        )),
+                    }
+                }
+            }
+            Err(e) => error(format!("{e:#}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => {
+            println!("no {}; deploys will run nothing", deploy::DEPLOY_FILE)
+        }
+        Err(e) => error(format!("cannot read {}: {e}", path.display())),
+    }
+
+    if let Ok(eff) = config::effective(repo) {
+        match repo.branch()? {
+            None => println!("warning: HEAD is detached; deploys will do nothing"),
+            Some(b) if !eff.branches.contains(&b) => {
+                println!("warning: {b} is not a target branch; deploys will do nothing")
+            }
+            Some(b) => match repo.upstream()? {
+                Some(u) => println!("branch: {b} (target), upstream {u}"),
+                None => error(format!("{b} has no upstream branch")),
+            },
+        }
+    }
+    let services = service::describe(repo);
+    for s in &services {
+        println!("service: {s}");
+    }
+    if !services.is_empty() {
+        println!(
+            "note: the service uses the PATH captured at install, which may differ from this shell's"
+        );
+    }
+    if errors > 0 {
+        println!("{errors} error(s)");
+    }
+    Ok(errors == 0)
+}
+
+enum Program {
+    Found,
+    MissingPath,
+    NotOnPath,
+}
+
+/// A program given as a path is resolved from the repo root, where steps run.
+fn find_program(root: &Path, program: &str) -> Program {
+    let executable = |p: &Path| {
+        fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if program.contains('/') {
+        return if executable(&root.join(program)) {
+            Program::Found
+        } else {
+            Program::MissingPath
+        };
+    }
+    let path = env::var_os("PATH").unwrap_or_default();
+    if env::split_paths(&path).any(|dir| executable(&dir.join(program))) {
+        Program::Found
+    } else {
+        Program::NotOnPath
+    }
 }
 
 fn list(items: &[String]) -> String {

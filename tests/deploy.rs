@@ -281,3 +281,59 @@ fn runs_run_and_uv_sections_in_file_order() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(env.uv_calls(), ["build", "run fast restart"]);
 }
+
+#[test]
+fn refuses_to_pull_an_invalid_deploy_file() {
+    let env = Env::new("");
+    env.cia(&["--add-branch", "main"]);
+    env.cia(&["--deploy"]);
+    env.push("DEPLOY.cia", "[uvv]\nrun = ['app']\n");
+    let out = env.cia(&["--deploy"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("refusing to pull"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!env.path("host/DEPLOY.cia").exists(), "must not pull");
+    assert!(env.uv_calls().is_empty());
+}
+
+#[test]
+fn check_reports_problems() {
+    let env = Env::new("");
+    env.cia(&["--add-branch", "main"]);
+    env.push(
+        "DEPLOY.cia",
+        "[run]\nrun = ['no-such-program-xyz', './build/app']\n[uv]\nrun = ['app']\n",
+    );
+    env.cia(&["--deploy"]);
+    let out = env.cia(&["--check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("error: no-such-program-xyz is not on PATH"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("warning: ./build/app does not exist yet"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("ok: uv run app"), "{stdout}");
+    assert!(stdout.contains("upstream origin/main"), "{stdout}");
+
+    fs::write(env.path("good.cia"), "[uv]\nrun = ['app']\n").unwrap();
+    let good = env.path("good.cia");
+    assert!(
+        env.cia(&["--check", good.to_str().unwrap()])
+            .status
+            .success()
+    );
+    fs::write(env.path("bad.cia"), "[uv]\nruns = ['app']\n").unwrap();
+    let bad = env.path("bad.cia");
+    assert!(
+        !env.cia(&["--check", bad.to_str().unwrap()])
+            .status
+            .success()
+    );
+}
