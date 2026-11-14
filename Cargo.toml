@@ -1,6 +1,6 @@
 [package]
 name = "ci-automator"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 description = "CI automations for hosts where hosted CI is not available"
@@ -19,7 +19,7 @@ libc = "0.2.191"
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.10.9"
 shell-words = "1.1.1"
-toml = { version = "1.1.8", features = ["preserve_order"] }
+toml = "1.1.8"
 
 [dev-dependencies]
 tempfile = "3.27.0"

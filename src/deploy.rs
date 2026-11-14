@@ -2,6 +2,7 @@ use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, BufRead, BufReader, Read},
     os::unix::process::{CommandExt, ExitStatusExt},
+    path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
     sync::{
         Arc,
@@ -13,12 +14,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 
 use crate::{
     config,
     git::{Repo, short},
-    interval::Interval,
+    interval::{self, Interval},
     log::{DEPLOY_START, Logger, now},
     state::State,
     webhook,
@@ -29,72 +29,333 @@ const DEFAULT_TIMEOUT: Interval = Interval::new(10, 'm');
 const POLL: Duration = Duration::from_millis(100);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Section {
-    run: Vec<String>,
-    timeout: Option<Interval>,
+const KEYWORDS: &[&str] = &[
+    "RUN", "TRY", "RUNNER", "TIMEOUT", "WORKDIR", "ENV", "SLEEP", "RETRY", "WHEN", "CHANGED",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum When {
+    Always,
+    Deploy,
+    Rollback,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retry {
+    pub tries: u32,
+    pub every: Interval,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Action {
+    Command {
+        program: String,
+        args: Vec<String>,
+        may_fail: bool,
+    },
+    Sleep(Interval),
+}
+
+#[derive(Debug)]
 pub struct Step {
-    pub program: String,
-    pub args: Vec<String>,
+    pub line: usize,
+    pub action: Action,
     pub timeout: Interval,
+    /// Relative to the repo root unless absolute.
+    pub workdir: PathBuf,
+    pub env: Vec<(String, String)>,
+    pub retry: Option<Retry>,
+    pub when: When,
+    /// Pathspecs; empty means the step runs whatever changed.
+    pub changed: Vec<String>,
 }
 
 impl Step {
     pub fn display(&self) -> String {
-        shell_words::join(std::iter::once(&self.program).chain(&self.args))
+        match &self.action {
+            Action::Command { program, args, .. } => {
+                shell_words::join(std::iter::once(program).chain(args))
+            }
+            Action::Sleep(d) => format!("sleep {d}"),
+        }
+    }
+
+    /// The settings that differ from the defaults, for dry-run and --check output.
+    pub fn details(&self) -> String {
+        let Action::Command { may_fail, .. } = self.action else {
+            return String::new();
+        };
+        let mut parts = vec![format!("timeout {}", self.timeout)];
+        if self.workdir != Path::new(".") {
+            parts.push(format!("in {}", self.workdir.display()));
+        }
+        if let Some(r) = self.retry.filter(|_| !may_fail) {
+            parts.push(format!("up to {} tries every {}", r.tries, r.every));
+        }
+        if may_fail {
+            parts.push("may fail".into());
+        }
+        format!(" ({})", parts.join(", "))
+    }
+
+    fn runs_in(&self, mode: Mode) -> bool {
+        match self.when {
+            When::Always => true,
+            When::Deploy => mode == Mode::Deploy,
+            When::Rollback => mode == Mode::Rollback,
+        }
     }
 }
 
-/// Sections run in the order they appear in the file. Every problem is reported, not just the first.
+struct Settings {
+    runner: Vec<String>,
+    timeout: Interval,
+    workdir: PathBuf,
+    env: Vec<(String, String)>,
+    retry: Option<Retry>,
+    when: When,
+    changed: Vec<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            runner: Vec::new(),
+            timeout: DEFAULT_TIMEOUT,
+            workdir: PathBuf::from("."),
+            env: Vec::new(),
+            retry: None,
+            when: When::Always,
+            changed: Vec::new(),
+        }
+    }
+}
+
+/// Steps run in file order. Every problem is reported, not just the first.
 pub fn parse_steps(text: &str) -> Result<Vec<Step>> {
-    let table: toml::Table =
-        toml::from_str(text).with_context(|| format!("invalid {DEPLOY_FILE}"))?;
+    let mut settings = Settings::default();
     let mut steps = Vec::new();
     let mut errors = Vec::new();
-    for (name, value) in table {
-        let prefix: &[&str] = match name.as_str() {
-            "uv" => &["uv", "run"],
-            "run" => &[],
-            _ => {
-                errors.push(format!("unknown section [{name}]"));
-                continue;
-            }
-        };
-        let section = match Section::deserialize(value) {
-            Ok(section) => section,
-            Err(e) => {
-                errors.push(format!("invalid [{name}] section: {}", e.message()));
-                continue;
-            }
-        };
-        let timeout = section.timeout.unwrap_or(DEFAULT_TIMEOUT);
-        for entry in &section.run {
-            let words = match shell_words::split(entry) {
-                Ok(words) if words.is_empty() => {
-                    errors.push(format!("empty [{name}] run entry"));
-                    continue;
-                }
-                Ok(words) => words,
-                Err(e) => {
-                    errors.push(format!("invalid [{name}] run entry {entry:?}: {e}"));
-                    continue;
-                }
-            };
-            let mut words = prefix.iter().map(|w| w.to_string()).chain(words);
-            steps.push(Step {
-                program: words.next().unwrap_or_default(),
-                args: words.collect(),
-                timeout,
-            });
+    for (line, instruction) in instructions(text) {
+        match parse_instruction(&mut settings, &instruction) {
+            Ok(Some(action)) => steps.push(Step {
+                line,
+                action,
+                timeout: settings.timeout,
+                workdir: settings.workdir.clone(),
+                env: settings.env.clone(),
+                retry: settings.retry,
+                when: settings.when,
+                changed: settings.changed.clone(),
+            }),
+            Ok(None) => {}
+            Err(e) => errors.push(format!("line {line}: {e}")),
         }
     }
     if !errors.is_empty() {
         bail!("invalid {DEPLOY_FILE}: {}", errors.join("; "));
     }
     Ok(steps)
+}
+
+/// Joins continuation lines and drops comments, keeping each instruction's first line number.
+fn instructions(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut pending: Option<(usize, String)> = None;
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.starts_with('#') || (line.is_empty() && pending.is_none()) {
+            continue;
+        }
+        let (body, continues) = match line.strip_suffix('\\') {
+            Some(body) => (body.trim_end(), true),
+            None => (line, false),
+        };
+        let (_, text) = pending.get_or_insert_with(|| (i + 1, String::new()));
+        if !text.is_empty() && !body.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(body);
+        if !continues {
+            out.extend(pending.take());
+        }
+    }
+    out.extend(pending);
+    out
+}
+
+/// Updates the settings, and returns the step if the instruction is one.
+fn parse_instruction(s: &mut Settings, instruction: &str) -> Result<Option<Action>, String> {
+    let (keyword, rest) = instruction
+        .split_once(char::is_whitespace)
+        .map_or((instruction, ""), |(k, r)| (k, r.trim()));
+    let words = || shell_words::split(rest).map_err(|e| format!("cannot split {rest:?}: {e}"));
+    let one = || match words()?.as_slice() {
+        [word] => Ok(word.clone()),
+        _ => Err(format!("{keyword} takes one argument")),
+    };
+    let interval = || interval::parse(&one()?);
+    match keyword {
+        "RUN" | "TRY" => {
+            let words = words()?;
+            if words.is_empty() {
+                return Err(format!("{keyword} needs a command"));
+            }
+            let mut words = s.runner.iter().cloned().chain(words);
+            return Ok(Some(Action::Command {
+                program: words.next().unwrap_or_default(),
+                args: words.collect(),
+                may_fail: keyword == "TRY",
+            }));
+        }
+        "SLEEP" => return Ok(Some(Action::Sleep(interval()?))),
+        "RUNNER" => {
+            s.runner = match words()? {
+                w if w.is_empty() => return Err("RUNNER needs a command prefix, or none".into()),
+                w if w == ["none"] => Vec::new(),
+                w => w,
+            }
+        }
+        "TIMEOUT" => s.timeout = interval()?,
+        "WORKDIR" => s.workdir = PathBuf::from(one()?),
+        "ENV" => {
+            let words = words()?;
+            if words.is_empty() {
+                return Err("ENV needs KEY=value".into());
+            }
+            for word in words {
+                let (key, value) = word
+                    .split_once('=')
+                    .ok_or_else(|| format!("ENV expects KEY=value, got {word:?}"))?;
+                if !is_env_name(key) {
+                    return Err(format!("invalid variable name {key:?}"));
+                }
+                if key.starts_with("CIA_") {
+                    return Err(format!("{key} is set by cia and cannot be changed"));
+                }
+                s.env.retain(|(k, _)| k != key);
+                s.env.push((key.into(), value.into()));
+            }
+        }
+        "RETRY" => s.retry = parse_retry(&words()?)?,
+        "WHEN" => {
+            s.when = match one()?.as_str() {
+                "always" => When::Always,
+                "deploy" => When::Deploy,
+                "rollback" => When::Rollback,
+                other => {
+                    return Err(format!(
+                        "WHEN expects deploy, rollback or always, got {other:?}"
+                    ));
+                }
+            }
+        }
+        "CHANGED" => {
+            let words = words()?;
+            s.changed = match words.as_slice() {
+                [] => return Err("CHANGED needs paths, or any".into()),
+                [any] if any == "any" => Vec::new(),
+                w if w.iter().any(|p| p == "any") => {
+                    return Err("CHANGED any cannot be combined with paths".into());
+                }
+                _ => words,
+            }
+        }
+        _ if keyword.starts_with('[') => {
+            return Err(format!(
+                "unknown instruction {keyword}; {DEPLOY_FILE} no longer uses TOML sections, \
+                 see docs/DEPLOY.cia.md"
+            ));
+        }
+        _ if KEYWORDS.contains(&keyword.to_uppercase().as_str()) => {
+            return Err(format!(
+                "instructions are uppercase: {}",
+                keyword.to_uppercase()
+            ));
+        }
+        _ => return Err(format!("unknown instruction {keyword}")),
+    }
+    Ok(None)
+}
+
+fn parse_retry(words: &[String]) -> Result<Option<Retry>, String> {
+    let usage =
+        || "RETRY expects <tries> every <interval>, e.g. RETRY 5 every 2s, or none".to_string();
+    match words {
+        [none] if none == "none" => Ok(None),
+        [tries, every, interval] if every == "every" => {
+            let tries: u32 = tries.parse().map_err(|_| usage())?;
+            if tries < 2 {
+                return Err("RETRY needs at least 2 tries".into());
+            }
+            Ok(Some(Retry {
+                tries,
+                every: interval::parse(interval)?,
+            }))
+        }
+        _ => Err(usage()),
+    }
+}
+
+fn is_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Deploy,
+    Rollback,
+}
+
+struct Run {
+    mode: Mode,
+    commit: String,
+    previous: Option<String>,
+    /// The commit CHANGED compares against; None runs every step.
+    base: Option<String>,
+}
+
+impl Run {
+    fn new(
+        repo: &Repo,
+        mode: Mode,
+        commit: &str,
+        previous: Option<&str>,
+        force: bool,
+    ) -> Result<Self> {
+        let base = match previous {
+            Some(prev) if !force && !repo.changed(prev, commit, &[DEPLOY_FILE.into()])? => {
+                Some(prev.to_string())
+            }
+            _ => None,
+        };
+        Ok(Self {
+            mode,
+            commit: commit.to_string(),
+            previous: previous.map(String::from),
+            base,
+        })
+    }
+
+    /// Why the step is skipped as unchanged, if it is.
+    fn unchanged(&self, repo: &Repo, step: &Step) -> Result<Option<String>> {
+        match &self.base {
+            Some(base)
+                if !step.changed.is_empty()
+                    && !repo.changed(base, &self.commit, &step.changed)? =>
+            {
+                Ok(Some(format!(
+                    "nothing changed under {}",
+                    step.changed.join(" ")
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -272,7 +533,14 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
         Ok(steps) => steps,
         Err(e) => return Err(roll_back(repo, log, state, &head, good, false, e)),
     };
-    if steps.is_empty() {
+    let run = Run::new(
+        repo,
+        Mode::Deploy,
+        &head,
+        state.last_deployed.as_deref(),
+        force,
+    )?;
+    if !steps.iter().any(|s| s.runs_in(Mode::Deploy)) {
         log.event(&format!(
             "{branch} at {}: {DEPLOY_FILE} defines nothing to run",
             short(&head)
@@ -288,7 +556,7 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     ));
     state.last_attempted = Some(head.clone());
     let started = Instant::now();
-    if let Err(e) = steps.iter().try_for_each(|step| run_step(repo, log, step)) {
+    if let Err(e) = run_steps(repo, log, &steps, &run) {
         return Err(roll_back(repo, log, state, &head, good, true, e));
     }
     log.event(&format!(
@@ -332,9 +600,8 @@ fn roll_back(
         .git(&["reset", "--hard", "--quiet", &good])
         .and_then(|_| {
             if steps_ran {
-                read_steps(repo)?
-                    .iter()
-                    .try_for_each(|step| run_step(repo, log, step))?;
+                let run = Run::new(repo, Mode::Rollback, &good, Some(failed), false)?;
+                run_steps(repo, log, &read_steps(repo)?, &run)?;
             }
             Ok(())
         });
@@ -418,13 +685,24 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
     if steps.is_empty() {
         println!("{DEPLOY_FILE} defines nothing to run");
     }
-    let label = if will_run {
-        "would run"
-    } else {
-        "would not run"
-    };
+    let run = Run::new(
+        repo,
+        Mode::Deploy,
+        &remote,
+        state.last_deployed.as_deref(),
+        force,
+    )?;
     for step in &steps {
-        println!("{label}: {} (timeout {})", step.display(), step.timeout);
+        let line = format!("{}{}", step.display(), step.details());
+        if !step.runs_in(Mode::Deploy) {
+            println!("only on rollback: {line}");
+        } else if !will_run {
+            println!("would not run: {line}");
+        } else if let Some(why) = run.unchanged(repo, step)? {
+            println!("would skip: {line}; {why}");
+        } else {
+            println!("would run: {line}");
+        }
     }
     if !will_run {
         return Ok(());
@@ -492,25 +770,81 @@ fn lock(repo: &Repo) -> Result<Option<File>> {
     }
 }
 
-fn run_step(repo: &Repo, log: &Logger, step: &Step) -> Result<()> {
+fn run_steps(repo: &Repo, log: &Logger, steps: &[Step], run: &Run) -> Result<()> {
+    for step in steps.iter().filter(|s| s.runs_in(run.mode)) {
+        if let Some(why) = run.unchanged(repo, step)? {
+            log.event(&format!("skipped {}: {why}", step.display()));
+            continue;
+        }
+        let may_fail = match step.action {
+            Action::Sleep(d) => {
+                log.event(&format!("sleeping {d}"));
+                thread::sleep(d.duration());
+                continue;
+            }
+            Action::Command { may_fail, .. } => may_fail,
+        };
+        let retry = step.retry.filter(|_| !may_fail);
+        let tries = retry.map_or(1, |r| r.tries);
+        for attempt in 1..=tries {
+            let Err(e) = run_command(repo, log, step, run) else {
+                break;
+            };
+            match retry.filter(|_| attempt < tries) {
+                Some(r) => {
+                    log.event(&format!(
+                        "{e:#}; try {} of {tries} in {}",
+                        attempt + 1,
+                        r.every
+                    ));
+                    thread::sleep(r.every.duration());
+                }
+                None if may_fail => {
+                    log.event(&format!("{e:#}; continuing because it is a TRY step"))
+                }
+                None => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_command(repo: &Repo, log: &Logger, step: &Step, run: &Run) -> Result<()> {
+    let Action::Command { program, args, .. } = &step.action else {
+        return Ok(());
+    };
     let name = step.display();
-    log.event(&format!("running {name}"));
+    let dir = repo.root.join(&step.workdir);
+    if step.workdir == Path::new(".") {
+        log.event(&format!("running {name}"));
+    } else {
+        log.event(&format!("running {name} in {}", step.workdir.display()));
+    }
+    if !dir.is_dir() {
+        bail!("{name}: working directory {} does not exist", dir.display());
+    }
     let started = Instant::now();
-    let mut child = Command::new(&step.program)
-        .args(&step.args)
-        .current_dir(&repo.root)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(&dir)
+        .envs(step.env.iter().map(|(k, v)| (k, v)))
+        .env("CIA_COMMIT", &run.commit)
+        .env(
+            "CIA_ROLLBACK",
+            if run.mode == Mode::Rollback { "1" } else { "0" },
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Own process group so a timeout can kill everything the step started.
-        .process_group(0)
+        .process_group(0);
+    match &run.previous {
+        Some(prev) => cmd.env("CIA_PREVIOUS_COMMIT", prev),
+        None => cmd.env_remove("CIA_PREVIOUS_COMMIT"),
+    };
+    let mut child = cmd
         .spawn()
-        .with_context(|| {
-            format!(
-                "failed to start {}; is it installed and on PATH?",
-                step.program
-            )
-        })?;
+        .with_context(|| format!("failed to start {program}; is it installed and on PATH?"))?;
 
     let discard = Arc::new(AtomicBool::new(false));
     let mut readers = Vec::new();
@@ -606,71 +940,187 @@ fn secs(d: Duration) -> String {
 mod tests {
     use super::*;
 
+    fn command(step: &Step) -> (&str, Vec<&str>, bool) {
+        match &step.action {
+            Action::Command {
+                program,
+                args,
+                may_fail,
+            } => (
+                program.as_str(),
+                args.iter().map(String::as_str).collect(),
+                *may_fail,
+            ),
+            Action::Sleep(_) => panic!("not a command"),
+        }
+    }
+
+    fn err(text: &str) -> String {
+        parse_steps(text).err().unwrap().to_string()
+    }
+
     #[test]
-    fn uv_entries_become_uv_run_commands() {
-        let steps =
-            parse_steps("[uv]\nrun = ['fast restart', 'migrate --to \"v2 final\"']\n").unwrap();
-        assert_eq!(steps.len(), 2);
-        assert_eq!(steps[0].program, "uv");
-        assert_eq!(steps[0].args, ["run", "fast", "restart"]);
-        assert_eq!(steps[1].args, ["run", "migrate", "--to", "v2 final"]);
+    fn run_lines_split_like_a_shell_but_run_directly() {
+        let steps = parse_steps("RUN migrate --to \"v2 final\"\nRUN app; rm -rf /\n").unwrap();
+        assert_eq!(
+            command(&steps[0]),
+            ("migrate", vec!["--to", "v2 final"], false)
+        );
+        assert_eq!(command(&steps[1]), ("app;", vec!["rm", "-rf", "/"], false));
         assert_eq!(steps[0].timeout, DEFAULT_TIMEOUT);
+        assert_eq!(steps[0].workdir, Path::new("."));
+        assert_eq!(steps[0].when, When::Always);
+        assert_eq!(steps[1].line, 2);
     }
 
     #[test]
-    fn run_entries_run_directly() {
-        let steps = parse_steps("[run]\nrun = ['systemctl --user restart app']\n").unwrap();
-        assert_eq!(steps[0].program, "systemctl");
-        assert_eq!(steps[0].args, ["--user", "restart", "app"]);
-    }
-
-    #[test]
-    fn sections_run_in_file_order() {
-        let text = "[run]\nrun = ['make']\ntimeout = '1m'\n[uv]\nrun = ['migrate']\n";
+    fn comments_blank_lines_and_continuations() {
+        let text = "# deploy\n\n  RUN podman build \\\n    -t app:latest \\\n    .\nRUN next\n";
         let steps = parse_steps(text).unwrap();
-        assert_eq!(steps[0].display(), "make");
-        assert_eq!(steps[0].timeout, Interval::new(1, 'm'));
-        assert_eq!(steps[1].display(), "uv run migrate");
-        assert_eq!(steps[1].timeout, DEFAULT_TIMEOUT);
-        let reversed = "[uv]\nrun = ['migrate']\n[run]\nrun = ['make']\n";
-        assert_eq!(parse_steps(reversed).unwrap()[0].program, "uv");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].display(), "podman build -t app:latest .");
+        assert_eq!(steps[0].line, 3);
+        assert_eq!(steps[1].line, 6);
     }
 
     #[test]
-    fn shell_syntax_is_not_interpreted() {
-        let steps = parse_steps("[uv]\nrun = ['app; rm -rf /']\n").unwrap();
-        assert_eq!(steps[0].args, ["run", "app;", "rm", "-rf", "/"]);
+    fn runner_prefixes_run_and_try_until_cleared() {
+        let text = "RUNNER uv run\nRUN fast restart\nTRY fast status\nRUNNER none\nRUN make\n";
+        let steps = parse_steps(text).unwrap();
+        assert_eq!(steps[0].display(), "uv run fast restart");
+        assert_eq!(
+            command(&steps[1]),
+            ("uv", vec!["run", "fast", "status"], true)
+        );
+        assert_eq!(steps[2].display(), "make");
     }
 
     #[test]
-    fn custom_timeout() {
-        let steps = parse_steps("[uv]\nrun = ['x']\ntimeout = '30s'\n").unwrap();
-        assert_eq!(steps[0].timeout, Interval::new(30, 's'));
+    fn settings_apply_to_the_steps_below() {
+        let text = "\
+TIMEOUT 20m
+WORKDIR prototype
+ENV A=1 B=\"two words\"
+RUN build
+WORKDIR .
+ENV A=3
+TIMEOUT 30s
+RETRY 5 every 2s
+RUN check
+RETRY none
+RUN last
+";
+        let steps = parse_steps(text).unwrap();
+        assert_eq!(steps[0].timeout, Interval::new(20, 'm'));
+        assert_eq!(steps[0].workdir, Path::new("prototype"));
+        assert_eq!(
+            steps[0].env,
+            [("A".into(), "1".into()), ("B".into(), "two words".into())]
+        );
+        assert_eq!(steps[0].retry, None);
+        assert_eq!(steps[1].timeout, Interval::new(30, 's'));
+        assert_eq!(steps[1].workdir, Path::new("."));
+        assert_eq!(
+            steps[1].env,
+            [("B".into(), "two words".into()), ("A".into(), "3".into())]
+        );
+        assert_eq!(
+            steps[1].retry,
+            Some(Retry {
+                tries: 5,
+                every: Interval::new(2, 's')
+            })
+        );
+        assert_eq!(steps[2].retry, None);
     }
 
     #[test]
-    fn rejects_unknown_sections_and_keys() {
-        assert!(parse_steps("[uvv]\nrun = ['x']\n").is_err());
-        assert!(parse_steps("[uv]\nruns = ['x']\n").is_err());
-        assert!(parse_steps("[uv]\nrun = ['']\n").is_err());
-        assert!(parse_steps("[run]\nrun = ['  ']\n").is_err());
-        assert!(parse_steps("uv = 'x'\n").is_err());
+    fn sleep_when_and_changed() {
+        let text = "\
+WHEN deploy
+SLEEP 5s
+CHANGED prototype/ 'shared lib/'
+RUN a
+WHEN rollback
+CHANGED any
+RUN b
+WHEN always
+RUN c
+";
+        let steps = parse_steps(text).unwrap();
+        assert_eq!(steps[0].action, Action::Sleep(Interval::new(5, 's')));
+        assert_eq!(steps[0].when, When::Deploy);
+        assert_eq!(steps[1].changed, ["prototype/", "shared lib/"]);
+        assert_eq!(steps[2].when, When::Rollback);
+        assert!(steps[2].changed.is_empty());
+        assert_eq!(steps[3].when, When::Always);
+        assert!(steps[0].runs_in(Mode::Deploy) && !steps[0].runs_in(Mode::Rollback));
+        assert!(steps[2].runs_in(Mode::Rollback) && !steps[2].runs_in(Mode::Deploy));
+        assert!(steps[3].runs_in(Mode::Rollback) && steps[3].runs_in(Mode::Deploy));
     }
 
     #[test]
-    fn reports_every_problem() {
-        let err = parse_steps("[uvv]\nrun = ['x']\n[run]\nrun = ['ok', '', 'a \"b']\n")
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(err.contains("unknown section [uvv]"), "{err}");
-        assert!(err.contains("empty [run] run entry"), "{err}");
-        assert!(err.contains("invalid [run] run entry"), "{err}");
+    fn rejects_bad_instructions() {
+        for text in [
+            "RUN\n",
+            "RUN   \n",
+            "TRY\n",
+            "RUN a \"b\n",
+            "run app\n",
+            "FROM alpine\n",
+            "TIMEOUT\n",
+            "TIMEOUT 10\n",
+            "TIMEOUT 1m 2m\n",
+            "SLEEP soon\n",
+            "RUNNER\n",
+            "WORKDIR\n",
+            "WORKDIR a b\n",
+            "ENV\n",
+            "ENV A\n",
+            "ENV 1A=x\n",
+            "ENV CIA_COMMIT=x\n",
+            "RETRY 5\n",
+            "RETRY 1 every 2s\n",
+            "RETRY five every 2s\n",
+            "RETRY 5 each 2s\n",
+            "WHEN sometimes\n",
+            "CHANGED\n",
+            "CHANGED any src/\n",
+        ] {
+            assert!(parse_steps(text).is_err(), "{text:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn reports_every_problem_with_line_numbers() {
+        let e = err("RUN ok\nBOGUS x\n# comment\nTIMEOUT never\nrun app\n");
+        assert!(e.contains("line 2: unknown instruction BOGUS"), "{e}");
+        assert!(e.contains("line 4: invalid interval 'never'"), "{e}");
+        assert!(e.contains("line 5: instructions are uppercase: RUN"), "{e}");
+    }
+
+    #[test]
+    fn points_old_toml_files_at_the_reference() {
+        let e = err("[uv]\nrun = ['fast restart']\n");
+        assert!(e.contains("line 1: unknown instruction [uv]"), "{e}");
+        assert!(e.contains("docs/DEPLOY.cia.md"), "{e}");
     }
 
     #[test]
     fn empty_file_has_no_steps() {
         assert!(parse_steps("").unwrap().is_empty());
+        assert!(parse_steps("# nothing\n\nTIMEOUT 1m\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn details_show_non_default_settings() {
+        let steps = parse_steps("RUN a\nWORKDIR web\nRETRY 3 every 1s\nRUN b\nTRY c\n").unwrap();
+        assert_eq!(steps[0].details(), " (timeout 10m)");
+        assert_eq!(
+            steps[1].details(),
+            " (timeout 10m, in web, up to 3 tries every 1s)"
+        );
+        assert_eq!(steps[2].details(), " (timeout 10m, in web, may fail)");
     }
 
     #[test]
