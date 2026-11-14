@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     deploy::{self, Cia},
-    git::Repo,
+    git::{self, Repo},
 };
 
 pub const FILE_NAME: &str = "CIA";
@@ -27,6 +27,16 @@ impl Project {
         let text =
             fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
         let cia = parse(file, &text)?;
+        match cia.branch.as_deref() {
+            None => bail!(
+                "{} needs a BRANCH line with the branch to deploy",
+                file.display()
+            ),
+            Some(b) if !git::is_valid_branch_name(b)? => {
+                bail!("BRANCH {b} is not a valid branch name")
+            }
+            Some(_) => {}
+        }
         let dir = dir_of(file);
         let repo = open_local(&dir, cia.local.as_deref())?;
         Ok(Self {
@@ -36,6 +46,26 @@ impl Project {
             cia,
             repo,
         })
+    }
+
+    pub fn branch(&self) -> &str {
+        self.cia.branch.as_deref().unwrap_or_default()
+    }
+
+    /// Fails if REPOSITORY is set and origin points somewhere else.
+    pub fn verify_repository(&self) -> Result<()> {
+        let Some(expected) = &self.cia.repository else {
+            return Ok(());
+        };
+        let origin = self.repo.origin_url()?;
+        match &origin {
+            Some(url) if same_repository(url, expected) => Ok(()),
+            Some(url) => bail!(
+                "{} pulls from {url}, but {FILE_NAME} says REPOSITORY {expected}",
+                self.repo.root.display()
+            ),
+            None => bail!("{} has no origin remote", self.repo.root.display()),
+        }
     }
 
     /// The CIA text that last deployed successfully, which a rollback re-runs.
@@ -78,6 +108,22 @@ pub fn locate(arg: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
+/// Compares GitHub-style URLs, ignoring the scheme, user, case, a trailing slash and .git:
+/// https://github.com/o/r, git@github.com:o/r.git and ssh://git@github.com/o/r are the same.
+pub fn same_repository(a: &str, b: &str) -> bool {
+    fn key(url: &str) -> String {
+        let url = url.trim().trim_end_matches('/');
+        let url = url.strip_suffix(".git").unwrap_or(url);
+        let rest = match url.split_once("://") {
+            Some((_, rest)) => rest.to_string(),
+            None => url.replacen(':', "/", 1),
+        };
+        let rest = rest.rsplit_once('@').map_or(rest.as_str(), |(_, r)| r);
+        rest.to_lowercase()
+    }
+    key(a) == key(b)
+}
+
 pub fn dir_of(file: &Path) -> PathBuf {
     file.parent().map_or_else(PathBuf::new, Path::to_path_buf)
 }
@@ -112,6 +158,27 @@ pub fn resolve_local(dir: &Path, local: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compares_repository_urls() {
+        let https = "https://github.com/RandomFractal/rto-track";
+        for same in [
+            "https://github.com/RandomFractal/rto-track.git",
+            "https://github.com/randomfractal/rto-track/",
+            "git@github.com:RandomFractal/rto-track.git",
+            "ssh://git@github.com/RandomFractal/rto-track",
+        ] {
+            assert!(same_repository(https, same), "{same}");
+        }
+        assert!(!same_repository(
+            https,
+            "https://github.com/RandomFractal/other"
+        ));
+        assert!(!same_repository(
+            https,
+            "https://gitlab.com/RandomFractal/rto-track"
+        ));
+    }
 
     #[test]
     fn resolves_local_paths() {

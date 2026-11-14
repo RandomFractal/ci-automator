@@ -48,8 +48,9 @@ impl Repo {
         self.try_git(&["symbolic-ref", "-q", "--short", "HEAD"])
     }
 
-    pub fn upstream(&self) -> Result<Option<String>> {
-        self.try_git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    /// `git remote get-url` is newer than the git on RHEL 7.
+    pub fn origin_url(&self) -> Result<Option<String>> {
+        self.try_git(&["config", "--get", "remote.origin.url"])
     }
 
     pub fn is_dirty(&self) -> Result<bool> {

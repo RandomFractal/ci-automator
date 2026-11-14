@@ -58,7 +58,10 @@ impl Env {
     fn write_cia(&self, steps: &str) {
         fs::write(
             self.cia_dir().join("CIA"),
-            format!("LOCAL {}\n{steps}", self.path("host").display()),
+            format!(
+                "LOCAL {}\nBRANCH main\n{steps}",
+                self.path("host").display()
+            ),
         )
         .unwrap();
     }
@@ -140,7 +143,6 @@ fn stderr(out: &Output) -> String {
 #[test]
 fn deploys_only_when_there_is_something_new() {
     let env = Env::new("");
-    assert!(env.cia(&["--add-branch", "main"]).status.success());
 
     let out = env.cia(&["--deploy"]);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -170,36 +172,104 @@ fn deploys_only_when_there_is_something_new() {
 }
 
 #[test]
-fn skips_branches_that_are_not_targets() {
+fn refuses_a_clone_on_another_branch() {
     let env = Env::new("");
+    env.git(&env.path("host"), &["checkout", "-q", "-b", "other"]);
     env.push_cia("RUN uv run app\n");
     let out = env.cia(&["--deploy"]);
-    assert!(out.status.success());
-    assert!(stderr(&out).contains("not a target branch"));
-    assert!(env.uv_calls().is_empty());
+    assert!(!out.status.success());
     assert!(
-        !env.path("host/app.txt").exists(),
-        "must not pull a non-target branch"
+        stderr(&out).contains("is on other, but CIA watches main"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(env.uv_calls().is_empty());
+    assert!(!env.path("host/app.txt").exists(), "must not pull");
+    let out = env.cia(&["--check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("is on other, but BRANCH is main"),
+        "{stdout}"
     );
 }
 
 #[test]
-fn global_branches_apply_to_repos() {
-    let env = Env::new("");
-    assert!(
-        env.cia(&["--add-branch", "main", "--global"])
-            .status
-            .success()
-    );
-    env.push_cia("RUN uv run app\n");
+fn a_new_branch_runs_everything_and_never_rolls_back_across() {
+    let env = Env::new(FAIL_ON_BAD);
+    env.ready();
+    env.push_cia("CHANGED web/\nRUN uv run good\n");
     assert!(env.cia(&["--deploy"]).status.success());
-    assert_eq!(env.uv_calls(), ["run app"]);
+    assert_eq!(env.uv_calls(), ["run good"]);
+
+    let dev = env.path("dev");
+    env.git(&dev, &["checkout", "-q", "-b", "staging"]);
+    env.commit("staging.txt", "s");
+    env.git(&dev, &["push", "-q", "-u", "origin", "staging"]);
+    let host = env.path("host");
+    env.git(&host, &["fetch", "-q", "origin"]);
+    env.git(
+        &host,
+        &["checkout", "-q", "-b", "staging", "origin/staging"],
+    );
+    let cia = env.cia_dir().join("CIA");
+    let text = fs::read_to_string(&cia)
+        .unwrap()
+        .replace("BRANCH main", "BRANCH staging")
+        .replace("good", "bad");
+    fs::write(&cia, text).unwrap();
+    let out = env.cia(&["--deploy"]);
+    assert!(!out.status.success());
+    assert_eq!(
+        env.uv_calls(),
+        ["run good", "run bad"],
+        "CHANGED is ignored on a new branch, and there is no rollback to main's commit"
+    );
+    assert!(!stderr(&out).contains("rolled back"), "{}", stderr(&out));
+    assert!(
+        env.log("events.log")
+            .contains("BRANCH changed from main to staging")
+    );
+}
+
+#[test]
+fn repository_must_match_origin() {
+    let env = Env::new("");
+    env.ready();
+    let cia = env.cia_dir().join("CIA");
+    let text = fs::read_to_string(&cia).unwrap();
+    fs::write(
+        &cia,
+        format!("REPOSITORY https://github.com/o/elsewhere\n{text}"),
+    )
+    .unwrap();
+    env.push("x", "1");
+    let out = env.cia(&["--deploy"]);
+    assert!(
+        stderr(&out).contains("but CIA says REPOSITORY https://github.com/o/elsewhere"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!env.path("host/x").exists());
+
+    let origin = env
+        .command("git", &env.path("host"))
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .unwrap();
+    let origin = String::from_utf8_lossy(&origin.stdout).trim().to_string();
+    fs::write(
+        &cia,
+        format!("REPOSITORY {}/\n{text}", origin.trim_end_matches(".git")),
+    )
+    .unwrap();
+    let out = env.cia(&["--deploy"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(env.path("host/x").exists());
 }
 
 #[test]
 fn failed_deploy_is_retried_on_the_next_run() {
     let env = Env::new("exit 3");
-    env.cia(&["--add-branch", "main"]);
     env.push_cia("RUN uv run app\n");
 
     let out = env.cia(&["--deploy"]);
@@ -223,7 +293,6 @@ fn failed_deploy_is_retried_on_the_next_run() {
 #[test]
 fn timed_out_steps_are_killed() {
     let env = Env::new("sleep 30");
-    env.cia(&["--add-branch", "main"]);
     env.push_cia("TIMEOUT 1s\nRUN uv run app\n");
     let started = Instant::now();
     let out = env.cia(&["--deploy"]);
@@ -235,7 +304,6 @@ fn timed_out_steps_are_killed() {
 #[test]
 fn refuses_to_pull_over_local_changes() {
     let env = Env::new("");
-    env.cia(&["--add-branch", "main"]);
     fs::write(env.path("host/README"), "edited").unwrap();
     env.push_cia("RUN uv run app\n");
     let out = env.cia(&["--deploy"]);
@@ -247,7 +315,6 @@ fn refuses_to_pull_over_local_changes() {
 #[test]
 fn dry_run_changes_nothing() {
     let env = Env::new("");
-    env.cia(&["--add-branch", "main"]);
     env.cia(&["--deploy"]);
     env.push_cia("RUN uv run fast restart\n");
     let out = env.cia(&["--deploy", "--dry-run"]);
@@ -275,26 +342,13 @@ fn dry_run_changes_nothing() {
 #[test]
 fn config_commands() {
     let env = Env::new("");
-    assert!(env.cia(&["--add-branch", "main"]).status.success());
-    assert!(env.cia(&["--add-branch", "staging"]).status.success());
-    assert!(env.cia(&["--rm-branch", "main"]).status.success());
     assert!(env.cia(&["--interval", "30s"]).status.success());
     assert!(!env.cia(&["--interval", "30"]).status.success());
-    assert!(!env.cia(&["--add-branch", "bad..name"]).status.success());
     let cfg = fs::read_to_string(env.path("host/.git/cia/config.toml")).unwrap();
-    assert!(
-        cfg.contains("staging") && !cfg.contains("main") && cfg.contains("30s"),
-        "{cfg}"
-    );
+    assert!(cfg.contains("30s"), "{cfg}");
     assert!(
         env.log("events.log")
-            .contains("config: added target branch staging")
-    );
-    assert!(env.cia(&["--reset-branches"]).status.success());
-    assert!(
-        !fs::read_to_string(env.path("host/.git/cia/config.toml"))
-            .unwrap()
-            .contains("staging")
+            .contains("config: interval set to 30s")
     );
     assert!(!env.cia(&["--deploy", "--global"]).status.success());
 }
@@ -302,7 +356,6 @@ fn config_commands() {
 #[test]
 fn runner_applies_to_the_steps_below_it() {
     let env = Env::new("");
-    assert!(env.cia(&["--add-branch", "main"]).status.success());
     assert!(env.cia(&["--deploy"]).status.success());
 
     env.push_cia("RUN uv build\nRUNNER uv run\nRUN fast restart\n");
@@ -314,13 +367,12 @@ fn runner_applies_to_the_steps_below_it() {
 #[test]
 fn refuses_to_pull_with_an_invalid_cia_file() {
     let env = Env::new("");
-    env.cia(&["--add-branch", "main"]);
     env.cia(&["--deploy"]);
     env.push_cia("BOGUS app\n");
     let out = env.cia(&["--deploy"]);
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("line 2: unknown instruction BOGUS"),
+        stderr(&out).contains("line 3: unknown instruction BOGUS"),
         "{}",
         stderr(&out)
     );
@@ -331,14 +383,13 @@ fn refuses_to_pull_with_an_invalid_cia_file() {
 #[test]
 fn check_reports_problems() {
     let env = Env::new("");
-    env.cia(&["--add-branch", "main"]);
     env.push_cia("RUN no-such-program-xyz\nRUN ./build/app\nRUN uv run app\n");
     env.cia(&["--deploy"]);
     let out = env.cia(&["--check"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!out.status.success(), "{stdout}");
     assert!(
-        stdout.contains("error: line 2: no-such-program-xyz is not on PATH"),
+        stdout.contains("error: line 3: no-such-program-xyz is not on PATH"),
         "{stdout}"
     );
     assert!(
@@ -346,12 +397,12 @@ fn check_reports_problems() {
         "{stdout}"
     );
     assert!(stdout.contains("ok: uv run app"), "{stdout}");
-    assert!(stdout.contains("upstream origin/main"), "{stdout}");
+    assert!(stdout.contains("branch: main"), "{stdout}");
 
     let host = env.path("host");
     fs::write(
         env.path("good"),
-        format!("LOCAL {}\nRUN uv run app\n", host.display()),
+        format!("LOCAL {}\nBRANCH main\nRUN uv run app\n", host.display()),
     )
     .unwrap();
     let good = env.path("good");
@@ -362,7 +413,7 @@ fn check_reports_problems() {
     );
     fs::write(
         env.path("bad"),
-        format!("LOCAL {}\nRUNS app\n", host.display()),
+        format!("LOCAL {}\nBRANCH main\nRUNS app\n", host.display()),
     )
     .unwrap();
     let bad = env.path("bad");
@@ -378,7 +429,6 @@ const FAIL_ON_BAD: &str = "case \"$2\" in bad) exit 3;; esac";
 #[test]
 fn failed_deploy_rolls_back_to_the_last_good_commit() {
     let env = Env::new(FAIL_ON_BAD);
-    env.cia(&["--add-branch", "main"]);
     env.cia(&["--deploy"]);
     env.push_cia("RUN uv run good\n");
     assert!(env.cia(&["--deploy"]).status.success());
@@ -424,7 +474,6 @@ fn failed_deploy_rolls_back_to_the_last_good_commit() {
 #[test]
 fn rollback_can_be_turned_off() {
     let env = Env::new(FAIL_ON_BAD);
-    env.cia(&["--add-branch", "main"]);
     assert!(env.cia(&["--rollback", "off"]).status.success());
     env.cia(&["--deploy"]);
     env.push_cia("RUN uv run good\n");
@@ -438,7 +487,6 @@ fn rollback_can_be_turned_off() {
 #[test]
 fn log_last_shows_only_the_last_deploy() {
     let env = Env::new("echo \"output of $2\"");
-    env.cia(&["--add-branch", "main"]);
     env.cia(&["--deploy"]);
     env.push_cia("RUN uv run first\n");
     env.cia(&["--deploy"]);
@@ -467,7 +515,6 @@ impl Env {
 
     /// Records a baseline, so later pushes deploy.
     fn ready(&self) {
-        assert!(self.cia(&["--add-branch", "main"]).status.success());
         assert!(self.cia(&["--deploy"]).status.success());
     }
 }
@@ -628,11 +675,11 @@ fn check_reports_workdir_and_changed_problems() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!out.status.success(), "{stdout}");
     assert!(
-        stdout.contains("error: line 3: WORKDIR nope does not exist"),
+        stdout.contains("error: line 4: WORKDIR nope does not exist"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("warning: line 6: CHANGED zzz/ matches no tracked file"),
+        stdout.contains("warning: line 7: CHANGED zzz/ matches no tracked file"),
         "{stdout}"
     );
 }
@@ -684,7 +731,6 @@ fn sign(secret: &str, body: &str) -> String {
 #[test]
 fn signed_push_webhook_triggers_a_deploy() {
     let env = Env::new("");
-    env.cia(&["--add-branch", "main"]);
     env.cia(&["--interval", "1h"]);
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -767,7 +813,7 @@ fn finds_the_cia_file_by_path_or_directory() {
 fn local_must_name_the_top_of_a_clone() {
     let env = Env::new("");
     let cia = env.cia_dir().join("CIA");
-    fs::write(&cia, "RUN uv run app\n").unwrap();
+    fs::write(&cia, "BRANCH main\nRUN uv run app\n").unwrap();
     let out = env.cia(&["--deploy"]);
     assert!(
         stderr(&out).contains("needs a LOCAL line"),
@@ -775,12 +821,31 @@ fn local_must_name_the_top_of_a_clone() {
         stderr(&out)
     );
 
-    fs::write(&cia, "LOCAL ../../../nope\n").unwrap();
+    fs::write(&cia, "LOCAL ../../../host\n").unwrap();
+    let out = env.cia(&["--deploy"]);
+    assert!(
+        stderr(&out).contains("needs a BRANCH line"),
+        "{}",
+        stderr(&out)
+    );
+    fs::write(&cia, "LOCAL ../../../host\nBRANCH bad..name\n").unwrap();
+    let out = env.cia(&["--deploy"]);
+    assert!(
+        stderr(&out).contains("not a valid branch name"),
+        "{}",
+        stderr(&out)
+    );
+
+    fs::write(&cia, "BRANCH main\nLOCAL ../../../nope\n").unwrap();
     let out = env.cia(&["--deploy"]);
     assert!(stderr(&out).contains("does not exist"), "{}", stderr(&out));
 
     fs::create_dir_all(env.path("host/sub")).unwrap();
-    fs::write(&cia, format!("LOCAL {}\n", env.path("host/sub").display())).unwrap();
+    fs::write(
+        &cia,
+        format!("BRANCH main\nLOCAL {}\n", env.path("host/sub").display()),
+    )
+    .unwrap();
     let out = env.cia(&["--deploy"]);
     assert!(
         stderr(&out).contains("point LOCAL at its top level"),
@@ -788,16 +853,19 @@ fn local_must_name_the_top_of_a_clone() {
         stderr(&out)
     );
 
-    fs::write(&cia, "LOCAL ../../../host\nRUN uv run app\nLOCAL x\n").unwrap();
+    fs::write(
+        &cia,
+        "BRANCH main\nLOCAL ../../../host\nRUN uv run app\nLOCAL x\n",
+    )
+    .unwrap();
     let out = env.cia(&["--deploy"]);
     assert!(
-        stderr(&out).contains("line 3: LOCAL must come before the first step"),
+        stderr(&out).contains("line 4: LOCAL must come before the first step"),
         "{}",
         stderr(&out)
     );
 
-    fs::write(&cia, "LOCAL ../../../host\n").unwrap();
-    assert!(env.cia(&["--add-branch", "main"]).status.success());
+    fs::write(&cia, "BRANCH main\nLOCAL ../../../host\n").unwrap();
     let out = env.cia(&["--deploy"]);
     assert!(
         out.status.success(),

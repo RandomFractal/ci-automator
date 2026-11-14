@@ -35,25 +35,13 @@ use crate::{
     about = "CI automations for hosts where hosted CI is not available"
 )]
 #[command(group(ArgGroup::new("action").required(true).args([
-    "add_branch", "rm_branch", "reset_branches", "interval", "rollback", "webhook", "show_config",
+    "interval", "rollback", "webhook", "show_config",
     "check", "deploy", "watch", "status", "log", "install_service", "uninstall_service",
 ])))]
 struct Cli {
     /// The CIA file, or a directory holding one (default: ./CIA)
     #[arg(value_name = "CIA")]
     cia: Option<PathBuf>,
-
-    /// Add a branch that automations apply to
-    #[arg(long, value_name = "BRANCH")]
-    add_branch: Option<String>,
-
-    /// Remove a branch that automations apply to
-    #[arg(long, value_name = "BRANCH")]
-    rm_branch: Option<String>,
-
-    /// Remove all branches that automations apply to
-    #[arg(long)]
-    reset_branches: bool,
 
     /// How often --watch runs automations, e.g. 30s, 5m, 2h, 1d
     #[arg(long, value_name = "NN{s|m|h|d}", value_parser = interval::parse)]
@@ -75,7 +63,7 @@ struct Cli {
     #[arg(long)]
     check: bool,
 
-    /// Pull the current branch if it is a target and run the CIA steps on changes
+    /// Pull BRANCH and run the CIA steps if there is something new
     #[arg(long)]
     deploy: bool,
 
@@ -148,16 +136,7 @@ fn run(cli: Cli) -> Result<bool> {
     };
     let file = || project::locate(cli.cia.as_deref());
     let load = || Project::load(&file()?);
-    if let Some(branch) = &cli.add_branch {
-        add_branch(cli.cia.as_deref(), branch, cli.global)?;
-    } else if let Some(branch) = &cli.rm_branch {
-        rm_branch(cli.cia.as_deref(), branch, cli.global)?;
-    } else if cli.reset_branches {
-        edit_config(cli.cia.as_deref(), cli.global, |cfg| {
-            cfg.branches.clear();
-            Some("removed all target branches".into())
-        })?;
-    } else if let Some(interval) = cli.interval {
+    if let Some(interval) = cli.interval {
         edit_config(cli.cia.as_deref(), cli.global, |cfg| {
             cfg.interval = Some(interval);
             Some(format!("interval set to {interval}"))
@@ -206,41 +185,6 @@ fn run(cli: Cli) -> Result<bool> {
         service::uninstall(&project::dir_of(&file()?), scope)?;
     }
     Ok(true)
-}
-
-fn add_branch(cia: Option<&Path>, branch: &str, global: bool) -> Result<()> {
-    if !git::is_valid_branch_name(branch)? {
-        bail!("'{branch}' is not a valid branch name");
-    }
-    edit_config(cia, global, |cfg| {
-        if cfg.branches.iter().any(|b| b == branch) {
-            println!("{branch} is already a target branch");
-            return None;
-        }
-        cfg.branches.push(branch.to_string());
-        Some(format!("added target branch {branch}"))
-    })
-}
-
-fn rm_branch(cia: Option<&Path>, branch: &str, global: bool) -> Result<()> {
-    let set_globally = !global
-        && Config::load(&config::global_path()?)?
-            .branches
-            .iter()
-            .any(|b| b == branch);
-    edit_config(cia, global, |cfg| {
-        let before = cfg.branches.len();
-        cfg.branches.retain(|b| b != branch);
-        if cfg.branches.len() < before {
-            return Some(format!("removed target branch {branch}"));
-        }
-        if set_globally {
-            println!("{branch} is set in the global config; use --global to remove it");
-        } else {
-            println!("{branch} is not a target branch");
-        }
-        None
-    })
 }
 
 /// Applies `change` and saves; it returns the change description, or None for no change.
@@ -304,7 +248,6 @@ fn set_webhook(cia: Option<&Path>, addr: &str) -> Result<()> {
 fn show_config(cia: Option<&Path>) -> Result<()> {
     let print = |label: &str, path: &std::path::Path, cfg: &Config| {
         println!("{label} ({})", path.display());
-        println!("  branches: {}", list(&cfg.branches));
         println!(
             "  interval: {}",
             cfg.interval.map_or("-".into(), |i| i.to_string())
@@ -326,7 +269,6 @@ fn show_config(cia: Option<&Path>) -> Result<()> {
     print("repo", &repo_path, &Config::load(&repo_path)?);
     let eff = config::effective(&project.repo)?;
     println!("effective");
-    println!("  branches: {}", list(&eff.branches));
     println!("  interval: {}", eff.interval);
     println!("  rollback: {}", on_off(eff.rollback));
     println!("  webhook:  {}", eff.webhook.as_deref().unwrap_or("off"));
@@ -337,16 +279,19 @@ fn status(project: &Project) -> Result<()> {
     let repo = &project.repo;
     let eff = config::effective(repo)?;
     let state = State::load(&project.dir)?;
-    let branch = match repo.branch()? {
-        Some(b) if eff.branches.contains(&b) => format!("{b} (target)"),
-        Some(b) => format!("{b} (not a target)"),
-        None => "detached HEAD".into(),
+    let checked_out = match repo.branch()? {
+        Some(b) if b == project.branch() => b,
+        Some(b) => format!("{b} (not BRANCH; deploys will fail)"),
+        None => "detached HEAD (deploys will fail)".into(),
     };
     let or_never = |v: &Option<String>| v.clone().unwrap_or_else(|| "never".into());
     println!("cia file:      {}", project.file.display());
     println!("local:         {}", repo.root.display());
-    println!("branch:        {branch}");
-    println!("targets:       {}", list(&eff.branches));
+    println!("branch:        {}", project.branch());
+    println!("checked out:   {checked_out}");
+    if let Some(url) = &project.cia.repository {
+        println!("repository:    {url}");
+    }
     println!("interval:      {}", eff.interval);
     if let Some(addr) = &eff.webhook {
         println!("webhook:       {addr} (while --watch runs)");
@@ -473,22 +418,34 @@ fn check(file: &Path) -> Result<bool> {
         }
     }
 
-    if let Ok(eff) = config::effective(&repo) {
-        if let Some(addr) = &eff.webhook {
-            match webhook::load_secret(&dir) {
-                Ok(_) => println!("webhook: {addr}"),
-                Err(e) => error(format!("{e:#}; run cia --webhook {addr} to create it")),
-            }
+    if let Ok(eff) = config::effective(&repo)
+        && let Some(addr) = &eff.webhook
+    {
+        match webhook::load_secret(&dir) {
+            Ok(_) => println!("webhook: {addr}"),
+            Err(e) => error(format!("{e:#}; run cia --webhook {addr} to create it")),
         }
-        match repo.branch()? {
-            None => println!("warning: HEAD is detached; deploys will do nothing"),
-            Some(b) if !eff.branches.contains(&b) => {
-                println!("warning: {b} is not a target branch; deploys will do nothing")
+    }
+    let branch = cia.branch.as_deref().unwrap_or_default();
+    match (cia.branch.is_some(), repo.branch()?) {
+        (false, _) => error(format!("{FILE_NAME} needs a BRANCH line")),
+        (true, Some(b)) if b == branch => println!("branch: {b}"),
+        (true, Some(b)) => error(format!(
+            "{} is on {b}, but BRANCH is {branch}",
+            repo.root.display()
+        )),
+        (true, None) => error(format!(
+            "{} has a detached HEAD, but BRANCH is {branch}",
+            repo.root.display()
+        )),
+    }
+    if let Some(expected) = &cia.repository {
+        match repo.origin_url()? {
+            Some(url) if project::same_repository(&url, expected) => {
+                println!("repository: {url}")
             }
-            Some(b) => match repo.upstream()? {
-                Some(u) => println!("branch: {b} (target), upstream {u}"),
-                None => error(format!("{b} has no upstream branch")),
-            },
+            Some(url) => error(format!("origin is {url}, but REPOSITORY is {expected}")),
+            None => error(format!("{} has no origin remote", repo.root.display())),
         }
     }
     let services = service::describe(&dir);
@@ -542,12 +499,4 @@ fn parse_on_off(s: &str) -> Result<bool, String> {
 
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
-}
-
-fn list(items: &[String]) -> String {
-    if items.is_empty() {
-        "-".into()
-    } else {
-        items.join(", ")
-    }
 }

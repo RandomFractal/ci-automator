@@ -20,6 +20,9 @@ pub struct State {
     pub last_deployed: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_deployed_at: Option<String>,
+    /// The BRANCH last_deployed came from; a rollback never crosses branches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_deployed_branch: Option<String>,
     /// A commit that failed and was rolled back; not retried until upstream moves or --force.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_failed: Option<String>,

@@ -33,12 +33,14 @@ const KEYWORDS: &[&str] = &[
     "RUN", "TRY", "RUNNER", "TIMEOUT", "WORKDIR", "ENV", "SLEEP", "RETRY", "WHEN", "CHANGED",
 ];
 /// Project settings: each may appear once, before the first step.
-const HEADER_KEYWORDS: &[&str] = &["LOCAL"];
+const HEADER_KEYWORDS: &[&str] = &["LOCAL", "REPOSITORY", "BRANCH"];
 
 #[derive(Debug, Default)]
 pub struct Cia {
     /// As written; resolved by `Project`.
     pub local: Option<String>,
+    pub repository: Option<String>,
+    pub branch: Option<String>,
     pub steps: Vec<Step>,
 }
 
@@ -186,6 +188,8 @@ fn parse_header(cia: &mut Cia, keyword: &str, rest: &str) -> Result<(), String> 
     };
     let field = match keyword {
         "LOCAL" => &mut cia.local,
+        "REPOSITORY" => &mut cia.repository,
+        "BRANCH" => &mut cia.branch,
         _ => unreachable!("not a header keyword"),
     };
     if field.is_some() {
@@ -462,9 +466,14 @@ pub fn watch(file: &Path) -> Result<()> {
     let mut interval = cfg.interval;
     let (wake_tx, wake) = mpsc::channel();
     if let Some(addr) = &cfg.webhook {
+        let filter = webhook::Filter {
+            branch: project.branch().to_string(),
+            repository: project.cia.repository.clone(),
+        };
         webhook::listen(
             addr,
             webhook::load_secret(&dir)?,
+            filter,
             log.clone(),
             wake_tx.clone(),
         )?;
@@ -514,20 +523,20 @@ fn check_and_deploy(
     force: bool,
 ) -> Result<String> {
     let repo = &project.repo;
-    let Some(branch) = repo.branch()? else {
-        return Ok(skip(log, "skipped: HEAD is detached"));
-    };
     let cfg = config::effective(&project.repo)?;
-    if !cfg.branches.contains(&branch) {
-        return Ok(skip(
-            log,
-            &format!("skipped: {branch} is not a target branch"),
-        ));
+    let Fetched {
+        branch,
+        upstream,
+        head: before,
+        remote,
+    } = fetch(project)?;
+    let switched = state
+        .last_deployed_branch
+        .as_deref()
+        .is_some_and(|b| b != branch);
+    if switched {
+        state.last_failed = None;
     }
-    let upstream = upstream(repo, &branch)?;
-    repo.git(&["fetch", "--quiet"])?;
-    let before = repo.git(&["rev-parse", "HEAD"])?;
-    let remote = repo.git(&["rev-parse", "@{u}"])?;
     if !force && state.last_failed.as_deref() == Some(remote.as_str()) {
         bail!(
             "{upstream} is still at {}, which failed and was rolled back; \
@@ -537,8 +546,8 @@ fn check_and_deploy(
     }
     let pulled = before != remote;
     if pulled {
-        ensure_fast_forward(repo, &branch, &upstream, &before, &remote)?;
-        repo.git(&["pull", "--ff-only", "--quiet"])?;
+        ensure_fast_forward(repo, branch, &upstream, &before, &remote)?;
+        repo.git(&["merge", "--ff-only", "--quiet", &remote])?;
     }
     let head = repo.git(&["rev-parse", "HEAD"])?;
     if pulled {
@@ -549,7 +558,13 @@ fn check_and_deploy(
         ));
     }
 
-    match decide(state, &head, pulled, force) {
+    if switched {
+        log.event(&format!(
+            "BRANCH changed from {} to {branch}; running every step, with no rollback across branches",
+            state.last_deployed_branch.as_deref().unwrap_or_default()
+        ));
+    }
+    match decide(state, &head, pulled, force || switched) {
         Decision::AlreadyDeployed => {
             return Ok(skip(
                 log,
@@ -571,14 +586,14 @@ fn check_and_deploy(
     let good = state
         .last_deployed
         .clone()
-        .filter(|good| cfg.rollback && *good != head);
+        .filter(|good| cfg.rollback && !switched && *good != head);
     let steps = &project.cia.steps;
     let edited = project.snapshot()?.as_deref() != Some(project.text.as_str());
     let run = Run::new(
         Mode::Deploy,
         &head,
         state.last_deployed.as_deref(),
-        force || edited,
+        force || edited || switched,
     );
     if !steps.iter().any(|s| s.runs_in(Mode::Deploy)) {
         log.event(&format!(
@@ -655,21 +670,25 @@ fn roll_back(
 
 fn dry_run(project: &Project, force: bool) -> Result<()> {
     let repo = &project.repo;
-    let Some(branch) = repo.branch()? else {
-        println!("HEAD is detached; nothing would run");
-        return Ok(());
-    };
     let cfg = config::effective(&project.repo)?;
-    if !cfg.branches.contains(&branch) {
-        println!("{branch} is not a target branch; nothing would run");
-        return Ok(());
-    }
-    let upstream = upstream(repo, &branch)?;
-    repo.git(&["fetch", "--quiet"])?;
-    let head = repo.git(&["rev-parse", "HEAD"])?;
-    let remote = repo.git(&["rev-parse", "@{u}"])?;
+    let Fetched {
+        branch,
+        upstream,
+        head,
+        remote,
+    } = fetch(project)?;
     let state = State::load(&project.dir)?;
-    if !force && state.last_failed.as_deref() == Some(remote.as_str()) {
+    let switched = state
+        .last_deployed_branch
+        .as_deref()
+        .is_some_and(|b| b != branch);
+    if switched {
+        println!(
+            "BRANCH changed from {}; every step would run, with no rollback",
+            state.last_deployed_branch.as_deref().unwrap_or_default()
+        );
+    }
+    if !force && !switched && state.last_failed.as_deref() == Some(remote.as_str()) {
         println!(
             "{upstream} is still at {}, which failed and was rolled back; nothing would run (use --force)",
             short(&remote)
@@ -678,8 +697,8 @@ fn dry_run(project: &Project, force: bool) -> Result<()> {
     }
     let pulled = head != remote;
     if pulled {
-        ensure_fast_forward(repo, &branch, &upstream, &head, &remote)?;
-        let commits = repo.git(&["log", "--oneline", "HEAD..@{u}"])?;
+        ensure_fast_forward(repo, branch, &upstream, &head, &remote)?;
+        let commits = repo.git(&["log", "--oneline", &format!("HEAD..{remote}")])?;
         println!(
             "would pull {} commit(s) from {upstream}:",
             commits.lines().count()
@@ -691,7 +710,7 @@ fn dry_run(project: &Project, force: bool) -> Result<()> {
         println!("{branch} is up to date with {upstream}");
     }
 
-    let will_run = match decide(&state, &remote, pulled, force) {
+    let will_run = match decide(&state, &remote, pulled, force || switched) {
         Decision::AlreadyDeployed => {
             println!(
                 "{} is already deployed; nothing would run (use --force)",
@@ -718,7 +737,7 @@ fn dry_run(project: &Project, force: bool) -> Result<()> {
         Mode::Deploy,
         &remote,
         state.last_deployed.as_deref(),
-        force || edited,
+        force || edited || switched,
     );
     for step in steps {
         let line = format!("{}{}", step.display(), step.details());
@@ -738,7 +757,7 @@ fn dry_run(project: &Project, force: bool) -> Result<()> {
     if let Some(good) = state
         .last_deployed
         .as_deref()
-        .filter(|g| cfg.rollback && *g != remote)
+        .filter(|g| cfg.rollback && !switched && *g != remote)
     {
         println!("if a step fails, would roll back to {}", short(good));
     }
@@ -752,13 +771,46 @@ fn skip(log: &Logger, msg: &str) -> String {
 fn mark_deployed(project: &Project, state: &mut State, head: &str) -> Result<()> {
     state.last_failed = None;
     state.last_deployed = Some(head.to_string());
+    state.last_deployed_branch = Some(project.branch().to_string());
     state.last_deployed_at = Some(now());
     project.save_snapshot()
 }
 
-fn upstream(repo: &Repo, branch: &str) -> Result<String> {
-    repo.upstream()?.with_context(|| {
-        format!("{branch} has no upstream branch; set one with: git branch --set-upstream-to=origin/{branch}")
+struct Fetched<'a> {
+    branch: &'a str,
+    upstream: String,
+    head: String,
+    remote: String,
+}
+
+/// Checks the clone is on BRANCH and points at REPOSITORY, then fetches BRANCH from origin.
+fn fetch(project: &Project) -> Result<Fetched<'_>> {
+    let repo = &project.repo;
+    let branch = project.branch();
+    match repo.branch()? {
+        Some(b) if b == branch => {}
+        Some(b) => bail!(
+            "{} is on {b}, but {FILE_NAME} watches {branch}; check out {branch} there",
+            repo.root.display()
+        ),
+        None => bail!(
+            "{} has a detached HEAD, but {FILE_NAME} watches {branch}; check out {branch} there",
+            repo.root.display()
+        ),
+    }
+    project.verify_repository()?;
+    let tracking = format!("refs/remotes/origin/{branch}");
+    repo.git(&[
+        "fetch",
+        "--quiet",
+        "origin",
+        &format!("+refs/heads/{branch}:{tracking}"),
+    ])?;
+    Ok(Fetched {
+        branch,
+        upstream: format!("origin/{branch}"),
+        head: repo.git(&["rev-parse", "HEAD"])?,
+        remote: repo.git(&["rev-parse", &tracking])?,
     })
 }
 

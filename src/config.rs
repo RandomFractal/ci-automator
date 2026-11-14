@@ -13,8 +13,6 @@ pub const DEFAULT_INTERVAL: Interval = Interval::new(5, 'm');
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub branches: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interval: Option<Interval>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,7 +43,6 @@ impl Config {
 }
 
 pub struct Effective {
-    pub branches: Vec<String>,
     pub interval: Interval,
     pub rollback: bool,
     pub webhook: Option<String>,
@@ -54,14 +51,7 @@ pub struct Effective {
 pub fn effective(repo: &Repo) -> Result<Effective> {
     let global = Config::load(&global_path()?)?;
     let local = Config::load(&repo_path(repo))?;
-    let mut branches = global.branches;
-    for b in local.branches {
-        if !branches.contains(&b) {
-            branches.push(b);
-        }
-    }
     Ok(Effective {
-        branches,
         interval: local
             .interval
             .or(global.interval)
@@ -98,14 +88,12 @@ mod tests {
     #[test]
     fn round_trips_toml() {
         let cfg = Config {
-            branches: vec!["main".into(), "staging".into()],
             interval: Some(Interval::new(30, 's')),
             rollback: Some(false),
             webhook: Some("127.0.0.1:9000".into()),
         };
         let text = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
-        assert_eq!(back.branches, cfg.branches);
         assert_eq!(back.interval, cfg.interval);
         assert_eq!(back.rollback, cfg.rollback);
         assert_eq!(back.webhook, cfg.webhook);
@@ -119,6 +107,6 @@ mod tests {
     #[test]
     fn rejects_bad_interval_and_unknown_keys() {
         assert!(toml::from_str::<Config>("interval = \"5x\"").is_err());
-        assert!(toml::from_str::<Config>("branch = [\"main\"]").is_err());
+        assert!(toml::from_str::<Config>("branches = [\"main\"]").is_err());
     }
 }
