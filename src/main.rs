@@ -92,7 +92,7 @@ struct Cli {
     #[arg(long)]
     uninstall_service: bool,
 
-    /// Use the global config, or a system-wide service, instead of the repo's or a user service
+    /// With --interval or --rollback and no action, set host defaults; with service commands, use a system-wide service
     #[arg(long, conflicts_with_all = ["show_config", "check", "deploy", "watch", "status", "log"])]
     global: bool,
 
