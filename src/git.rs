@@ -58,6 +58,20 @@ impl Repo {
         Ok(Some(self.git(&["show", &format!("{rev}:{path}")])?))
     }
 
+    /// Whether any file matching the pathspecs differs between the two commits.
+    pub fn changed(&self, from: &str, to: &str, paths: &[String]) -> Result<bool> {
+        let mut args = vec!["diff", "--name-only", from, to, "--"];
+        args.extend(paths.iter().map(String::as_str));
+        Ok(!self.git(&args)?.is_empty())
+    }
+
+    /// Whether any tracked file matches the pathspecs.
+    pub fn tracks(&self, paths: &[String]) -> Result<bool> {
+        let mut args = vec!["ls-files", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        Ok(!self.git(&args)?.is_empty())
+    }
+
     /// Runs git and returns None instead of an error when it exits non-zero.
     fn try_git(&self, args: &[&str]) -> Result<Option<String>> {
         let out = command(&self.root, args)

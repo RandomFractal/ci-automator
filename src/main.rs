@@ -389,16 +389,47 @@ fn check(repo: &Repo, file: Option<&Path>) -> Result<bool> {
         Ok(text) => match deploy::parse_steps(&text) {
             Ok(steps) => {
                 println!("{}: {} step(s)", path.display(), steps.len());
+                let mut seen_dirs = Vec::new();
+                let mut seen_changed = Vec::new();
                 for step in &steps {
-                    match find_program(&repo.root, &step.program) {
-                        Program::Found => println!("  ok: {}", step.display()),
+                    let dir = repo.root.join(&step.workdir);
+                    if !seen_dirs.contains(&step.workdir) {
+                        seen_dirs.push(step.workdir.clone());
+                        if !dir.is_dir() {
+                            let msg = format!(
+                                "line {}: WORKDIR {} does not exist",
+                                step.line,
+                                step.workdir.display()
+                            );
+                            if step.workdir.is_absolute() {
+                                println!("  warning: {msg}; fine if an earlier step creates it");
+                            } else {
+                                error(msg);
+                            }
+                        }
+                    }
+                    if !step.changed.is_empty() && !seen_changed.contains(&step.changed) {
+                        seen_changed.push(step.changed.clone());
+                        if !repo.tracks(&step.changed)? {
+                            println!(
+                                "  warning: line {}: CHANGED {} matches no tracked file",
+                                step.line,
+                                step.changed.join(" ")
+                            );
+                        }
+                    }
+                    let deploy::Action::Command { program, .. } = &step.action else {
+                        println!("  ok: {}", step.display());
+                        continue;
+                    };
+                    match find_program(&dir, program) {
+                        Program::Found => println!("  ok: {}{}", step.display(), step.details()),
                         Program::MissingPath => println!(
-                            "  warning: {} does not exist yet; fine if an earlier step creates it",
-                            step.program
+                            "  warning: {program} does not exist yet; fine if an earlier step creates it"
                         ),
                         Program::NotOnPath => error(format!(
-                            "{} is not on PATH ({})",
-                            step.program,
+                            "line {}: {program} is not on PATH ({})",
+                            step.line,
                             step.display()
                         )),
                     }
@@ -451,13 +482,13 @@ enum Program {
     NotOnPath,
 }
 
-/// A program given as a path is resolved from the repo root, where steps run.
-fn find_program(root: &Path, program: &str) -> Program {
+/// A program given as a path is resolved from the step's working directory.
+fn find_program(dir: &Path, program: &str) -> Program {
     let executable = |p: &Path| {
         fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     };
     if program.contains('/') {
-        return if executable(&root.join(program)) {
+        return if executable(&dir.join(program)) {
             Program::Found
         } else {
             Program::MissingPath

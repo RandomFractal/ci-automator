@@ -20,7 +20,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 install -m 755 target/x86_64-unknown-linux-musl/release/cia ~/.local/bin/
 ```
 
-The musl build is fully static, so it does not depend on the host's glibc (RHEL 7 ships 2.17). On ostree-based systems, put it in `~/.local/bin` or `/usr/local/bin`; no layering is needed. The host needs `git`, plus `uv` if `DEPLOY.cia` uses `[uv]`.
+The musl build is fully static, so it does not depend on the host's glibc (RHEL 7 ships 2.17). On ostree-based systems, put it in `~/.local/bin` or `/usr/local/bin`; no layering is needed. The host needs `git`, plus the programs `DEPLOY.cia` runs.
 
 ## Usage
 
@@ -59,11 +59,40 @@ Branches from both files are combined, and a repo interval overrides the global 
 
 1. If the current branch is not a target branch, or HEAD is detached, it does nothing.
 2. It fetches, then pulls with `--ff-only` if upstream has new commits. It refuses to pull if the branch has diverged, has local commits, has uncommitted changes to tracked files, or if `DEPLOY.cia` at the new commit is invalid, so a typo leaves the clone on the working commit.
-3. It reads `DEPLOY.cia` from the repo root and runs its steps in order from the root, stopping at the first failure.
+3. It reads `DEPLOY.cia` from the repo root and runs its steps in order, stopping at the first failure.
 
 Steps run only when HEAD differs from the last commit deployed successfully. `--force` runs the steps anyway. `--dry-run` prints what a run would do, including every `DEPLOY.cia` step, without pulling or running anything.
 
-If a step fails or times out, cia rolls back: it resets the clone to the last commit that deployed successfully (`git reset --hard`) and runs that commit's steps again. It then skips the failed commit until upstream moves past it or you run `--deploy --force`. Rollback restores the repo, not the app's data: anything a failed step changed outside the repo, such as a database migration, stays changed, and changes steps made to tracked files are discarded. Untracked and ignored files are kept. With no successful deploy to go back to, or with `cia --rollback off`, a failed deploy stays on the new commit and is retried on the next run.
+If a step fails or times out, cia rolls back: it resets the clone to the last commit that deployed successfully (`git reset --hard`) and runs that commit's steps again in rollback mode, where [`WHEN`](docs/DEPLOY.cia.md#when-deployrollbackalways) and [`CHANGED`](docs/DEPLOY.cia.md#changed-path-) pick which steps run. It then skips the failed commit until upstream moves past it or you run `--deploy --force`. Rollback restores the repo, not the app's data: anything a failed step changed outside the repo, such as a database migration, stays changed unless a `WHEN rollback` step undoes it, and changes steps made to tracked files are discarded. Untracked and ignored files are kept. With no successful deploy to go back to, or with `cia --rollback off`, a failed deploy stays on the new commit and is retried on the next run.
+
+The first run in a clone that pulls nothing records HEAD as the deployed baseline without running anything. That way, installing the service does not restart an app that is already current.
+
+Runs take a lock, so a manual `--deploy` cannot overlap the service.
+
+## `DEPLOY.cia`
+
+`DEPLOY.cia` at the repo root lists the steps a deploy runs. It reads like a Dockerfile: one instruction per line, and each setting applies to the steps below it.
+
+```dockerfile
+TIMEOUT 20m
+RUN podman build -t localhost/app:latest prototype
+RUN systemctl --user restart app
+
+RUNNER uv run
+RUN fast status
+```
+
+Steps run directly, never through a shell. Settings cover the prefix (`RUNNER`), time limit, working directory, environment, retries, deploy-only or rollback-only steps (`WHEN`), and steps that run only when certain paths changed (`CHANGED`). See the **[syntax reference](docs/DEPLOY.cia.md)** for every instruction and complete examples. Run `cia --check` to see every problem at once, or `cia --check path/to/DEPLOY.cia` to check a file before committing it.
+
+## `--deploy`
+
+1. If the current branch is not a target branch, or HEAD is detached, it does nothing.
+2. It fetches, then pulls with `--ff-only` if upstream has new commits. It refuses to pull if the branch has diverged, has local commits, has uncommitted changes to tracked files, or if `DEPLOY.cia` at the new commit is invalid, so a typo leaves the clone on the working commit.
+3. It reads `DEPLOY.cia` from the repo root and runs its steps in order, stopping at the first failure.
+
+Steps run only when HEAD differs from the last commit deployed successfully. `--force` runs the steps anyway. `--dry-run` prints what a run would do, including every `DEPLOY.cia` step, without pulling or running anything.
+
+If a step fails or times out, cia rolls back: it resets the clone to the last commit that deployed successfully (`git reset --hard`) and runs that commit's steps again in rollback mode, where [`WHEN`](docs/DEPLOY.cia.md#when-deployrollbackalways) and [`CHANGED`](docs/DEPLOY.cia.md#changed-path-) pick which steps run. It then skips the failed commit until upstream moves past it or you run `--deploy --force`. Rollback restores the repo, not the app's data: anything a failed step changed outside the repo, such as a database migration, stays changed unless a `WHEN rollback` step undoes it, and changes steps made to tracked files are discarded. Untracked and ignored files are kept. With no successful deploy to go back to, or with `cia --rollback off`, a failed deploy stays on the new commit and is retried on the next run.
 
 The first run in a clone that pulls nothing records HEAD as the deployed baseline without running anything. That way, installing the service does not restart an app that is already current.
 
