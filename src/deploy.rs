@@ -16,7 +16,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    config,
+    config::Overrides,
     git::{Repo, short},
     interval::{self, Interval},
     log::{DEPLOY_START, Logger, now},
@@ -33,7 +33,14 @@ const KEYWORDS: &[&str] = &[
     "RUN", "TRY", "RUNNER", "TIMEOUT", "WORKDIR", "ENV", "SLEEP", "RETRY", "WHEN", "CHANGED",
 ];
 /// Project settings: each may appear once, before the first step.
-const HEADER_KEYWORDS: &[&str] = &["LOCAL", "REPOSITORY", "BRANCH"];
+const HEADER_KEYWORDS: &[&str] = &[
+    "LOCAL",
+    "REPOSITORY",
+    "BRANCH",
+    "INTERVAL",
+    "ROLLBACK",
+    "WEBHOOK",
+];
 
 #[derive(Debug, Default)]
 pub struct Cia {
@@ -41,6 +48,9 @@ pub struct Cia {
     pub local: Option<String>,
     pub repository: Option<String>,
     pub branch: Option<String>,
+    pub interval: Option<Interval>,
+    pub rollback: Option<bool>,
+    pub webhook: Option<String>,
     pub steps: Vec<Step>,
 }
 
@@ -186,16 +196,43 @@ fn parse_header(cia: &mut Cia, keyword: &str, rest: &str) -> Result<(), String> 
         Ok([word]) => word.clone(),
         _ => return Err(format!("{keyword} takes one argument")),
     };
-    let field = match keyword {
-        "LOCAL" => &mut cia.local,
-        "REPOSITORY" => &mut cia.repository,
-        "BRANCH" => &mut cia.branch,
-        _ => unreachable!("not a header keyword"),
+    let once = |set: bool| {
+        if set {
+            Err(format!("{keyword} is set more than once"))
+        } else {
+            Ok(())
+        }
     };
-    if field.is_some() {
-        return Err(format!("{keyword} is set more than once"));
+    match keyword {
+        "LOCAL" => once(cia.local.is_some())?,
+        "REPOSITORY" => once(cia.repository.is_some())?,
+        "BRANCH" => once(cia.branch.is_some())?,
+        "INTERVAL" => once(cia.interval.is_some())?,
+        "ROLLBACK" => once(cia.rollback.is_some())?,
+        "WEBHOOK" => once(cia.webhook.is_some())?,
+        _ => unreachable!("not a header keyword"),
     }
-    *field = Some(value);
+    match keyword {
+        "LOCAL" => cia.local = Some(value),
+        "REPOSITORY" => cia.repository = Some(value),
+        "BRANCH" => cia.branch = Some(value),
+        "INTERVAL" => cia.interval = Some(interval::parse(&value)?),
+        "ROLLBACK" => {
+            cia.rollback = Some(match value.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(format!("ROLLBACK expects on or off, got {value:?}")),
+            })
+        }
+        _ => {
+            if value.parse::<std::net::SocketAddr>().is_err() {
+                return Err(format!(
+                    "WEBHOOK expects an address like 127.0.0.1:9000, got {value:?}"
+                ));
+            }
+            cia.webhook = Some(value);
+        }
+    }
     Ok(())
 }
 
@@ -458,14 +495,16 @@ fn record(dir: &Path, log: &Logger, mut state: State, result: Result<String>) ->
 }
 
 /// Re-reads the CIA file before every run, so edits apply without a restart.
-pub fn watch(file: &Path) -> Result<()> {
-    let project = Project::load(file)?;
+pub fn watch(file: &Path, overrides: &Overrides) -> Result<()> {
+    let load = || Project::load(file).map(|p| p.with(overrides.clone()));
+    let project = load()?;
     let dir = project.dir.clone();
     let log = Logger::new(&dir);
-    let cfg = config::effective(&project.repo)?;
+    let cfg = project.config()?;
     let mut interval = cfg.interval;
     let (wake_tx, wake) = mpsc::channel();
     if let Some(addr) = &cfg.webhook {
+        webhook::ensure_secret_logged(&dir, &log)?;
         let filter = webhook::Filter {
             branch: project.branch().to_string(),
             repository: project.cia.repository.clone(),
@@ -486,7 +525,7 @@ pub fn watch(file: &Path) -> Result<()> {
             .map_or(String::new(), |a| format!(", webhook on {a}"))
     ));
     loop {
-        let loaded = Project::load(file);
+        let loaded = load();
         let result = match &loaded {
             Ok(project) => deploy(project, Options::default()),
             Err(e) => State::load(&dir)
@@ -495,7 +534,7 @@ pub fn watch(file: &Path) -> Result<()> {
         if let Err(e) = result {
             log.error(&format!("{e:#}"));
         }
-        match loaded.and_then(|p| config::effective(&p.repo)) {
+        match loaded.and_then(|p| p.config()) {
             Ok(cfg) if cfg.interval != interval => {
                 log.event(&format!(
                     "interval changed from {interval} to {}",
@@ -523,7 +562,7 @@ fn check_and_deploy(
     force: bool,
 ) -> Result<String> {
     let repo = &project.repo;
-    let cfg = config::effective(&project.repo)?;
+    let cfg = project.config()?;
     let Fetched {
         branch,
         upstream,
@@ -670,7 +709,7 @@ fn roll_back(
 
 fn dry_run(project: &Project, force: bool) -> Result<()> {
     let repo = &project.repo;
-    let cfg = config::effective(&project.repo)?;
+    let cfg = project.config()?;
     let Fetched {
         branch,
         upstream,

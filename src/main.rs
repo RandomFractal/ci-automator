@@ -19,7 +19,7 @@ use anyhow::{Result, bail};
 use clap::{ArgGroup, Parser};
 
 use crate::{
-    config::Config,
+    config::{Config, Overrides},
     git::short,
     interval::Interval,
     log::Logger,
@@ -34,28 +34,33 @@ use crate::{
     version,
     about = "CI automations for hosts where hosted CI is not available"
 )]
-#[command(group(ArgGroup::new("action").required(true).args([
-    "interval", "rollback", "webhook", "show_config",
-    "check", "deploy", "watch", "status", "log", "install_service", "uninstall_service",
+#[command(group(ArgGroup::new("action").args([
+    "show_config", "check", "deploy", "watch", "status", "log", "install_service",
+    "uninstall_service",
 ])))]
 struct Cli {
     /// The CIA file, or a directory holding one (default: ./CIA)
     #[arg(value_name = "CIA")]
     cia: Option<PathBuf>,
 
-    /// How often --watch runs automations, e.g. 30s, 5m, 2h, 1d
-    #[arg(long, value_name = "NN{s|m|h|d}", value_parser = interval::parse)]
+    /// For this run, how often --watch runs, e.g. 30s, 5m, 2h, 1d (CIA: INTERVAL).
+    /// With --global and no action, sets the host default instead
+    #[arg(long, value_name = "NN{s|m|h|d}", value_parser = interval::parse,
+          conflicts_with_all = ["log", "install_service", "uninstall_service"])]
     interval: Option<Interval>,
 
-    /// Roll back to the last good commit when a deploy fails (default on)
-    #[arg(long, value_name = "on|off", value_parser = parse_on_off)]
+    /// For this run, roll back to the last good commit when a deploy fails (CIA: ROLLBACK).
+    /// With --global and no action, sets the host default instead
+    #[arg(long, value_name = "on|off", value_parser = parse_on_off,
+          conflicts_with_all = ["log", "install_service", "uninstall_service"])]
     rollback: Option<bool>,
 
-    /// Listen for GitHub push webhooks on ADDR (e.g. 127.0.0.1:9000) in --watch, or "off"
-    #[arg(long, value_name = "ADDR|off", conflicts_with = "global")]
+    /// For this run, listen for GitHub push webhooks on ADDR in --watch, or "off" (CIA: WEBHOOK)
+    #[arg(long, value_name = "ADDR|off", value_parser = parse_webhook,
+          conflicts_with_all = ["global", "log", "install_service", "uninstall_service"])]
     webhook: Option<String>,
 
-    /// Show the global, repo and effective config
+    /// Show the global, CIA and effective settings
     #[arg(long)]
     show_config: bool,
 
@@ -134,24 +139,17 @@ fn run(cli: Cli) -> Result<bool> {
     } else {
         Scope::User
     };
+    let overrides = Overrides {
+        interval: cli.interval,
+        rollback: cli.rollback,
+        webhook: cli.webhook.clone(),
+    };
     let file = || project::locate(cli.cia.as_deref());
-    let load = || Project::load(&file()?);
-    if let Some(interval) = cli.interval {
-        edit_config(cli.cia.as_deref(), cli.global, |cfg| {
-            cfg.interval = Some(interval);
-            Some(format!("interval set to {interval}"))
-        })?;
-    } else if let Some(on) = cli.rollback {
-        edit_config(cli.cia.as_deref(), cli.global, |cfg| {
-            cfg.rollback = Some(on);
-            Some(format!("rollback {}", on_off(on)))
-        })?;
-    } else if let Some(addr) = &cli.webhook {
-        set_webhook(cli.cia.as_deref(), addr)?;
-    } else if cli.show_config {
-        show_config(cli.cia.as_deref())?;
+    let load = || Project::load(&file()?).map(|p| p.with(overrides.clone()));
+    if cli.show_config {
+        show_config(cli.cia.as_deref(), &overrides)?;
     } else if cli.check {
-        return check(&file()?);
+        return check(&file()?, &overrides);
     } else if cli.deploy {
         let opts = deploy::Options {
             force: cli.force,
@@ -159,7 +157,7 @@ fn run(cli: Cli) -> Result<bool> {
         };
         return deploy::deploy(&load()?, opts);
     } else if cli.watch {
-        deploy::watch(&file()?)?;
+        deploy::watch(&file()?, &overrides)?;
     } else if cli.status {
         status(&load()?)?;
     } else if cli.log {
@@ -183,91 +181,78 @@ fn run(cli: Cli) -> Result<bool> {
         service::install(&load()?, scope)?;
     } else if cli.uninstall_service {
         service::uninstall(&project::dir_of(&file()?), scope)?;
+    } else if cli.global && (cli.interval.is_some() || cli.rollback.is_some()) {
+        set_global(cli.interval, cli.rollback)?;
+    } else {
+        bail!(
+            "nothing to do: pass an action such as --deploy or --watch, \
+             or --global to set host defaults (see --help)"
+        );
     }
     Ok(true)
 }
 
-/// Applies `change` and saves; it returns the change description, or None for no change.
-/// Repo-level changes go to the events log. Global ones have no repo to log to.
-fn edit_config(
-    cia: Option<&Path>,
-    global: bool,
-    change: impl FnOnce(&mut Config) -> Option<String>,
-) -> Result<()> {
-    let project = if global {
-        None
-    } else {
-        Some(Project::load(&project::locate(cia)?)?)
-    };
-    let path = match &project {
-        Some(p) => config::repo_path(&p.repo),
-        None => config::global_path()?,
-    };
+fn set_global(interval: Option<Interval>, rollback: Option<bool>) -> Result<()> {
+    let path = config::global_path()?;
     let mut cfg = Config::load(&path)?;
-    let Some(msg) = change(&mut cfg) else {
-        return Ok(());
-    };
-    cfg.save(&path)?;
-    match &project {
-        Some(p) => Logger::new(&p.dir).event(&format!("config: {msg}")),
-        None => println!("{msg} (global)"),
+    if let Some(interval) = interval {
+        cfg.interval = Some(interval);
+        println!("interval set to {interval} (global)");
     }
-    Ok(())
+    if let Some(on) = rollback {
+        cfg.rollback = Some(on);
+        println!("rollback {} (global)", on_off(on));
+    }
+    cfg.save(&path)
 }
 
-fn set_webhook(cia: Option<&Path>, addr: &str) -> Result<()> {
-    if addr == "off" {
-        return edit_config(cia, false, |cfg| {
-            cfg.webhook.take().map(|_| "webhook off".to_string())
-        });
-    }
-    if addr.parse::<std::net::SocketAddr>().is_err() {
-        bail!("'{addr}' is not an address like 127.0.0.1:9000");
-    }
-    edit_config(cia, false, |cfg| {
-        cfg.webhook = Some(addr.to_string());
-        Some(format!("webhook on {addr}"))
-    })?;
-    let dir = project::dir_of(&project::locate(cia)?);
-    let (secret, created) = webhook::ensure_secret(&dir)?;
-    if created {
-        println!(
-            "created the webhook secret {}",
-            webhook::secret_path(&dir).display()
-        );
-    }
-    println!(
-        "In GitHub, add a webhook under Settings > Webhooks with content type application/json, \
-         the push event, and this secret:\n  {secret}\n\
-         Point it at a public URL that forwards to {addr}, such as a reverse proxy or tunnel. \
-         Restart --watch or the service to start listening."
-    );
-    Ok(())
-}
-
-fn show_config(cia: Option<&Path>) -> Result<()> {
-    let print = |label: &str, path: &std::path::Path, cfg: &Config| {
-        println!("{label} ({})", path.display());
+fn show_config(cia: Option<&Path>, overrides: &Overrides) -> Result<()> {
+    let print = |label: String,
+                 interval: Option<Interval>,
+                 rollback: Option<bool>,
+                 webhook: Option<&str>| {
+        println!("{label}");
         println!(
             "  interval: {}",
-            cfg.interval.map_or("-".into(), |i| i.to_string())
+            interval.map_or("-".into(), |i| i.to_string())
         );
-        println!("  rollback: {}", cfg.rollback.map_or("-", on_off));
-        println!("  webhook:  {}", cfg.webhook.as_deref().unwrap_or("-"));
+        println!("  rollback: {}", rollback.map_or("-", on_off));
+        if let Some(webhook) = webhook {
+            println!("  webhook:  {webhook}");
+        }
     };
     let global_path = config::global_path()?;
-    print("global", &global_path, &Config::load(&global_path)?);
+    let global = Config::load(&global_path)?;
+    print(
+        format!("global ({})", global_path.display()),
+        global.interval,
+        global.rollback,
+        None,
+    );
     let project = match project::locate(cia) {
-        Ok(file) => Project::load(&file)?,
+        Ok(file) => Project::load(&file)?.with(overrides.clone()),
         Err(e) if cia.is_none() => {
             println!("({e:#})");
             return Ok(());
         }
         Err(e) => return Err(e),
     };
-    let repo_path = config::repo_path(&project.repo);
-    print("repo", &repo_path, &Config::load(&repo_path)?);
-    let eff = config::effective(&project.repo)?;
+    let c = &project.cia;
+    print(
+        format!("cia ({})", project.file.display()),
+        c.interval,
+        c.rollback,
+        Some(c.webhook.as_deref().unwrap_or("-")),
+    );
+    if overrides.interval.is_some() || overrides.rollback.is_some() || overrides.webhook.is_some() {
+        print(
+            "flags".into(),
+            overrides.interval,
+            overrides.rollback,
+            Some(overrides.webhook.as_deref().unwrap_or("-")),
+        );
+    }
+    let eff = project.config()?;
     println!("effective");
     println!("  interval: {}", eff.interval);
     println!("  rollback: {}", on_off(eff.rollback));
@@ -277,7 +262,7 @@ fn show_config(cia: Option<&Path>) -> Result<()> {
 
 fn status(project: &Project) -> Result<()> {
     let repo = &project.repo;
-    let eff = config::effective(repo)?;
+    let eff = project.config()?;
     let state = State::load(&project.dir)?;
     let checked_out = match repo.branch()? {
         Some(b) if b == project.branch() => b,
@@ -332,7 +317,7 @@ fn status(project: &Project) -> Result<()> {
 }
 
 /// Prints every problem it finds; returns false if any of them would make a deploy fail.
-fn check(file: &Path) -> Result<bool> {
+fn check(file: &Path, overrides: &Overrides) -> Result<bool> {
     let mut errors = 0;
     let mut error = |msg: String| {
         println!("error: {msg}");
@@ -360,9 +345,6 @@ fn check(file: &Path) -> Result<bool> {
         }
     };
     println!("local: {}", repo.root.display());
-    if let Err(e) = Config::load(&config::repo_path(&repo)) {
-        error(format!("{e:#}"));
-    }
     for name in ["DEPLOY.cia", FILE_NAME] {
         if repo.tracks(&[name.into()])? {
             println!(
@@ -418,12 +400,17 @@ fn check(file: &Path) -> Result<bool> {
         }
     }
 
-    if let Ok(eff) = config::effective(&repo)
+    if let Ok(eff) = config::effective(&cia, overrides)
         && let Some(addr) = &eff.webhook
     {
-        match webhook::load_secret(&dir) {
-            Ok(_) => println!("webhook: {addr}"),
-            Err(e) => error(format!("{e:#}; run cia --webhook {addr} to create it")),
+        let secret = webhook::secret_path(&dir);
+        if secret.exists() {
+            println!("webhook: {addr}, secret {}", secret.display());
+        } else {
+            println!(
+                "webhook: {addr}; --watch or --install-service will create the secret {}",
+                secret.display()
+            );
         }
     }
     let branch = cia.branch.as_deref().unwrap_or_default();
@@ -486,6 +473,14 @@ fn find_program(dir: &Path, program: &str) -> Program {
         Program::Found
     } else {
         Program::NotOnPath
+    }
+}
+
+fn parse_webhook(s: &str) -> Result<String, String> {
+    if s == "off" || s.parse::<std::net::SocketAddr>().is_ok() {
+        Ok(s.to_string())
+    } else {
+        Err("expected an address like 127.0.0.1:9000, or off".into())
     }
 }
 

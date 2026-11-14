@@ -44,6 +44,19 @@ pub fn ensure_secret(dir: &Path) -> Result<(String, bool)> {
     Ok((secret, true))
 }
 
+/// Creates the secret if needed and logs where it is and what GitHub needs.
+pub fn ensure_secret_logged(dir: &Path, log: &Logger) -> Result<String> {
+    let (secret, created) = ensure_secret(dir)?;
+    if created {
+        log.event(&format!(
+            "created the webhook secret {}; in GitHub, add a webhook under Settings > Webhooks \
+             with content type application/json, the push event, and that secret",
+            secret_path(dir).display()
+        ));
+    }
+    Ok(secret)
+}
+
 pub fn load_secret(dir: &Path) -> Result<String> {
     let path = secret_path(dir);
     let secret = fs::read_to_string(&path)

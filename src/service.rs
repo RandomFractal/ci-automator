@@ -11,6 +11,7 @@ use crate::{
     config,
     log::Logger,
     project::{self, Project},
+    webhook,
 };
 
 #[derive(Clone, Copy)]
@@ -30,6 +31,13 @@ impl fmt::Display for Scope {
 
 pub fn install(project: &Project, scope: Scope) -> Result<()> {
     require_root(scope)?;
+    if let Some(addr) = project.config()?.webhook {
+        webhook::ensure_secret_logged(&project.dir, &Logger::new(&project.dir))?;
+        println!(
+            "webhook on {addr}; its secret is in {}",
+            webhook::secret_path(&project.dir).display()
+        );
+    }
     let name = unit_name(&project.dir);
     let path = unit_dir(scope)?.join(&name);
     fs::create_dir_all(path.parent().unwrap_or(&path))?;

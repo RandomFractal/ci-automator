@@ -6,6 +6,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
+    config::{self, Effective, Overrides},
     deploy::{self, Cia},
     git::{self, Repo},
 };
@@ -20,6 +21,7 @@ pub struct Project {
     pub text: String,
     pub cia: Cia,
     pub repo: Repo,
+    pub overrides: Overrides,
 }
 
 impl Project {
@@ -45,7 +47,16 @@ impl Project {
             text,
             cia,
             repo,
+            overrides: Overrides::default(),
         })
+    }
+
+    pub fn with(self, overrides: Overrides) -> Self {
+        Self { overrides, ..self }
+    }
+
+    pub fn config(&self) -> Result<Effective> {
+        config::effective(&self.cia, &self.overrides)
     }
 
     pub fn branch(&self) -> &str {
