@@ -1,5 +1,4 @@
 use std::{
-    env,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -12,11 +11,22 @@ pub struct Repo {
 }
 
 impl Repo {
-    pub fn discover() -> Result<Self> {
-        let cwd = env::current_dir().context("cannot read the current directory")?;
+    /// Opens the clone whose top level is `path`.
+    pub fn open(path: &Path) -> Result<Self> {
+        if !path.is_dir() {
+            bail!("LOCAL {} does not exist", path.display());
+        }
         let root = PathBuf::from(
-            run(&cwd, &["rev-parse", "--show-toplevel"]).context("not inside a git repository")?,
+            run(path, &["rev-parse", "--show-toplevel"])
+                .with_context(|| format!("LOCAL {} is not a git clone", path.display()))?,
         );
+        if path.canonicalize()? != root.canonicalize()? {
+            bail!(
+                "LOCAL {} is inside the clone at {}; point LOCAL at its top level",
+                path.display(),
+                root.display()
+            );
+        }
         let git_dir = PathBuf::from(run(&root, &["rev-parse", "--git-dir"])?);
         let git_dir = if git_dir.is_absolute() {
             git_dir
@@ -46,16 +56,6 @@ impl Repo {
         Ok(!self
             .git(&["status", "--porcelain", "--untracked-files=no"])?
             .is_empty())
-    }
-
-    pub fn read_file_at(&self, rev: &str, path: &str) -> Result<Option<String>> {
-        if self
-            .git(&["ls-tree", "--name-only", rev, "--", path])?
-            .is_empty()
-        {
-            return Ok(None);
-        }
-        Ok(Some(self.git(&["show", &format!("{rev}:{path}")])?))
     }
 
     /// Whether any file matching the pathspecs differs between the two commits.

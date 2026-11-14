@@ -3,7 +3,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::Sender,
     thread,
     time::Duration,
@@ -13,19 +13,19 @@ use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::{git::Repo, log::Logger};
+use crate::log::Logger;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub fn secret_path(repo: &Repo) -> PathBuf {
-    repo.cia_dir().join("webhook-secret")
+pub fn secret_path(dir: &Path) -> PathBuf {
+    dir.join("webhook-secret")
 }
 
 /// Returns the secret, creating a random one readable only by the owner if there is none.
-pub fn ensure_secret(repo: &Repo) -> Result<(String, bool)> {
-    if let Ok(secret) = load_secret(repo) {
+pub fn ensure_secret(dir: &Path) -> Result<(String, bool)> {
+    if let Ok(secret) = load_secret(dir) {
         return Ok((secret, false));
     }
     let mut bytes = [0u8; 32];
@@ -33,8 +33,7 @@ pub fn ensure_secret(repo: &Repo) -> Result<(String, bool)> {
         .and_then(|mut f| f.read_exact(&mut bytes))
         .context("cannot read /dev/urandom")?;
     let secret = hex(&bytes);
-    let path = secret_path(repo);
-    fs::create_dir_all(repo.cia_dir())?;
+    let path = secret_path(dir);
     OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -45,8 +44,8 @@ pub fn ensure_secret(repo: &Repo) -> Result<(String, bool)> {
     Ok((secret, true))
 }
 
-pub fn load_secret(repo: &Repo) -> Result<String> {
-    let path = secret_path(repo);
+pub fn load_secret(dir: &Path) -> Result<String> {
+    let path = secret_path(dir);
     let secret = fs::read_to_string(&path)
         .with_context(|| format!("cannot read the webhook secret {}", path.display()))?;
     Ok(secret.trim().to_string())

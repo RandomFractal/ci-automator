@@ -1,9 +1,10 @@
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-
-use crate::git::Repo;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct State {
@@ -25,8 +26,8 @@ pub struct State {
 }
 
 impl State {
-    pub fn load(repo: &Repo) -> Result<Self> {
-        let path = path(repo);
+    pub fn load(dir: &Path) -> Result<Self> {
+        let path = path(dir);
         match fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text)
                 .with_context(|| format!("invalid state file {}", path.display())),
@@ -35,14 +36,13 @@ impl State {
         }
     }
 
-    pub fn save(&self, repo: &Repo) -> Result<()> {
-        let path = path(repo);
-        fs::create_dir_all(repo.cia_dir())?;
+    pub fn save(&self, dir: &Path) -> Result<()> {
+        let path = path(dir);
         fs::write(&path, toml::to_string(self)?)
             .with_context(|| format!("cannot write {}", path.display()))
     }
 }
 
-fn path(repo: &Repo) -> PathBuf {
-    repo.cia_dir().join("state.toml")
+fn path(dir: &Path) -> PathBuf {
+    dir.join("state.toml")
 }

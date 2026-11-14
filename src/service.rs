@@ -1,8 +1,17 @@
-use std::{env, fmt, fs, os::unix::fs::MetadataExt, path::PathBuf, process::Command};
+use std::{
+    env, fmt, fs,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result, bail};
 
-use crate::{config, git::Repo, log::Logger};
+use crate::{
+    config,
+    log::Logger,
+    project::{self, Project},
+};
 
 #[derive(Clone, Copy)]
 pub enum Scope {
@@ -19,20 +28,23 @@ impl fmt::Display for Scope {
     }
 }
 
-pub fn install(repo: &Repo, scope: Scope) -> Result<()> {
+pub fn install(project: &Project, scope: Scope) -> Result<()> {
     require_root(scope)?;
-    let name = unit_name(repo);
+    let name = unit_name(&project.dir);
     let path = unit_dir(scope)?.join(&name);
     fs::create_dir_all(path.parent().unwrap_or(&path))?;
-    fs::write(&path, render_unit(repo, scope)?)
-        .with_context(|| format!("cannot write {}", path.display()))?;
+    fs::write(
+        &path,
+        render_unit(&project.file, &project.repo.root, scope)?,
+    )
+    .with_context(|| format!("cannot write {}", path.display()))?;
     systemctl(scope, &["daemon-reload"])?;
     systemctl(scope, &["enable", &name])?;
     systemctl(scope, &["restart", &name])?;
     if let Scope::User = scope {
         enable_linger();
     }
-    Logger::new(repo).event(&format!("installed {scope} service {name}"));
+    Logger::new(&project.dir).event(&format!("installed {scope} service {name}"));
     println!("unit file: {}", path.display());
     println!(
         "follow it with: journalctl {}-u {name} -f",
@@ -41,25 +53,25 @@ pub fn install(repo: &Repo, scope: Scope) -> Result<()> {
     Ok(())
 }
 
-pub fn uninstall(repo: &Repo, scope: Scope) -> Result<()> {
+pub fn uninstall(dir: &Path, scope: Scope) -> Result<()> {
     require_root(scope)?;
-    let name = unit_name(repo);
+    let name = unit_name(dir);
     let path = unit_dir(scope)?.join(&name);
     if !path.exists() {
-        println!("no {scope} service is installed for this repo");
+        println!("no {scope} service {name} is installed");
         return Ok(());
     }
     systemctl(scope, &["stop", &name])?;
     systemctl(scope, &["disable", &name])?;
     fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
     systemctl(scope, &["daemon-reload"])?;
-    Logger::new(repo).event(&format!("uninstalled {scope} service {name}"));
+    Logger::new(dir).event(&format!("uninstalled {scope} service {name}"));
     Ok(())
 }
 
-/// Describes each installed service for this repo, e.g. "user cia-home-x-app.service: active".
-pub fn describe(repo: &Repo) -> Vec<String> {
-    let name = unit_name(repo);
+/// Describes each installed service for this CIA, e.g. "user cia-app.service: active".
+pub fn describe(dir: &Path) -> Vec<String> {
+    let name = unit_name(dir);
     [Scope::User, Scope::System]
         .into_iter()
         .filter(|&scope| unit_dir(scope).is_ok_and(|dir| dir.join(&name).exists()))
@@ -74,9 +86,12 @@ pub fn describe(repo: &Repo) -> Vec<String> {
         .collect()
 }
 
-fn unit_name(repo: &Repo) -> String {
-    let path = repo.root.to_string_lossy();
-    let slug: String = path
+/// Named after the directory holding the CIA file, e.g. ~/.cia/rto-track -> cia-rto-track.service.
+fn unit_name(dir: &Path) -> String {
+    let name = dir
+        .file_name()
+        .map_or_else(|| dir.to_string_lossy(), |n| n.to_string_lossy());
+    let slug: String = name
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' {
@@ -96,29 +111,30 @@ fn unit_dir(scope: Scope) -> Result<PathBuf> {
     })
 }
 
-fn render_unit(repo: &Repo, scope: Scope) -> Result<String> {
+fn render_unit(file: &Path, clone: &Path, scope: Scope) -> Result<String> {
     let exe = env::current_exe().context("cannot locate the cia binary")?;
-    let root = repo.root.to_string_lossy();
+    let file_str = file.to_string_lossy();
+    let dir = project::dir_of(file);
     // The service manager's PATH rarely includes ~/.local/bin, where uv usually lives.
     let path = env::var("PATH").unwrap_or_default();
     let (unit_extra, service_extra, wanted_by) = match scope {
         Scope::User => (String::new(), String::new(), "default.target"),
         Scope::System => (
             "After=network-online.target\nWants=network-online.target\n".to_string(),
-            // Run as the repo owner: git refuses repos owned by someone else.
-            format!("User={}\n", fs::metadata(&repo.root)?.uid()),
+            // Run as the clone's owner: git refuses repos owned by someone else.
+            format!("User={}\n", fs::metadata(clone)?.uid()),
             "multi-user.target",
         ),
     };
     Ok(format!(
         "\
 [Unit]
-Description=cia watcher for {root}
+Description=cia watcher for {desc}
 {unit_extra}
 [Service]
 Type=simple
 WorkingDirectory={workdir}
-ExecStart=\"{exe}\" --watch
+ExecStart=\"{exe}\" \"{file}\" --watch
 Environment=\"PATH={path}\"
 {service_extra}Restart=on-failure
 RestartSec=30
@@ -128,9 +144,10 @@ KillMode=process
 [Install]
 WantedBy={wanted_by}
 ",
-        root = escape_specifiers(&root),
-        workdir = escape_specifiers(&root),
+        desc = escape_specifiers(&file_str),
+        workdir = escape_specifiers(&dir.to_string_lossy()),
         exe = escape_quoted(&exe.to_string_lossy()),
+        file = escape_quoted(&file_str),
         path = escape_quoted(&path),
     ))
 }
@@ -196,35 +213,25 @@ fn enable_linger() {
 mod tests {
     use super::*;
 
-    fn repo(root: &str) -> Repo {
-        Repo {
-            root: root.into(),
-            git_dir: format!("{root}/.git").into(),
-        }
-    }
-
     #[test]
-    fn unit_name_is_readable() {
+    fn unit_name_is_the_cia_directory() {
         assert_eq!(
-            unit_name(&repo("/home/andrew/apps/my.repo")),
-            "cia-home-andrew-apps-my-repo.service"
+            unit_name(Path::new("/home/andrew/.cia/rto.track")),
+            "cia-rto-track.service"
         );
     }
 
     #[test]
     fn renders_user_and_system_units() {
         let dir = tempfile::tempdir().unwrap();
-        let r = Repo {
-            root: dir.path().into(),
-            git_dir: dir.path().join(".git"),
-        };
-        let user = render_unit(&r, Scope::User).unwrap();
+        let file = dir.path().join("CIA");
+        let user = render_unit(&file, dir.path(), Scope::User).unwrap();
         assert!(user.contains(&format!("WorkingDirectory={}\n", dir.path().display())));
-        assert!(user.contains("--watch\n"));
+        assert!(user.contains(&format!("\" \"{}\" --watch\n", file.display())));
         assert!(user.contains("KillMode=process"));
         assert!(user.contains("WantedBy=default.target"));
         assert!(!user.contains("User="));
-        let system = render_unit(&r, Scope::System).unwrap();
+        let system = render_unit(&file, dir.path(), Scope::System).unwrap();
         assert!(system.contains("User="));
         assert!(system.contains("WantedBy=multi-user.target"));
         assert!(system.contains("After=network-online.target"));
