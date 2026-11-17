@@ -3,7 +3,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::Sender,
     thread,
     time::Duration,
@@ -13,19 +13,19 @@ use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::{git::Repo, log::Logger};
+use crate::{log::Logger, project};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub fn secret_path(repo: &Repo) -> PathBuf {
-    repo.cia_dir().join("webhook-secret")
+pub fn secret_path(dir: &Path) -> PathBuf {
+    dir.join("webhook-secret")
 }
 
 /// Returns the secret, creating a random one readable only by the owner if there is none.
-pub fn ensure_secret(repo: &Repo) -> Result<(String, bool)> {
-    if let Ok(secret) = load_secret(repo) {
+pub fn ensure_secret(dir: &Path) -> Result<(String, bool)> {
+    if let Ok(secret) = load_secret(dir) {
         return Ok((secret, false));
     }
     let mut bytes = [0u8; 32];
@@ -33,8 +33,7 @@ pub fn ensure_secret(repo: &Repo) -> Result<(String, bool)> {
         .and_then(|mut f| f.read_exact(&mut bytes))
         .context("cannot read /dev/urandom")?;
     let secret = hex(&bytes);
-    let path = secret_path(repo);
-    fs::create_dir_all(repo.cia_dir())?;
+    let path = secret_path(dir);
     OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -45,20 +44,67 @@ pub fn ensure_secret(repo: &Repo) -> Result<(String, bool)> {
     Ok((secret, true))
 }
 
-pub fn load_secret(repo: &Repo) -> Result<String> {
-    let path = secret_path(repo);
+/// Creates the secret if needed and logs where it is and what GitHub needs.
+pub fn ensure_secret_logged(dir: &Path, log: &Logger) -> Result<String> {
+    let (secret, created) = ensure_secret(dir)?;
+    if created {
+        log.event(&format!(
+            "created the webhook secret {}; in GitHub, add a webhook under Settings > Webhooks \
+             with content type application/json, the push event, and that secret",
+            secret_path(dir).display()
+        ));
+    }
+    Ok(secret)
+}
+
+pub fn load_secret(dir: &Path) -> Result<String> {
+    let path = secret_path(dir);
     let secret = fs::read_to_string(&path)
         .with_context(|| format!("cannot read the webhook secret {}", path.display()))?;
     Ok(secret.trim().to_string())
 }
 
+/// Which pushes wake the watcher: those to BRANCH, and to REPOSITORY when it is set.
+pub struct Filter {
+    pub branch: String,
+    pub repository: Option<String>,
+}
+
+impl Filter {
+    fn matches(&self, body: &[u8]) -> Result<(), &'static str> {
+        let payload: serde_json::Value =
+            serde_json::from_slice(body).map_err(|_| "ignored: not a JSON push payload")?;
+        if payload["ref"].as_str() != Some(&format!("refs/heads/{}", self.branch)) {
+            return Err("ignored: another branch");
+        }
+        if let Some(expected) = &self.repository {
+            let repo = &payload["repository"];
+            let urls = ["html_url", "clone_url", "ssh_url"].map(|k| repo[k].as_str());
+            if !urls
+                .into_iter()
+                .flatten()
+                .any(|url| project::same_repository(url, expected))
+            {
+                return Err("ignored: another repository");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Binds now, so a bad address fails at startup, then serves on a background thread.
-/// Each signed push event sends one wake-up.
-pub fn listen(addr: &str, secret: String, log: Logger, wake: Sender<()>) -> Result<()> {
+/// Each signed push to the watched branch sends one wake-up.
+pub fn listen(
+    addr: &str,
+    secret: String,
+    filter: Filter,
+    log: Logger,
+    wake: Sender<()>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("cannot listen on {addr}"))?;
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let (status, msg) = handle(&stream, secret.as_bytes(), &wake);
+            let (status, msg) = handle(&stream, secret.as_bytes(), &filter, &wake);
             if status >= 400 {
                 log.info(&format!("webhook: rejected request ({status} {msg})"));
             }
@@ -68,7 +114,12 @@ pub fn listen(addr: &str, secret: String, log: Logger, wake: Sender<()>) -> Resu
     Ok(())
 }
 
-fn handle(stream: &TcpStream, secret: &[u8], wake: &Sender<()>) -> (u16, &'static str) {
+fn handle(
+    stream: &TcpStream,
+    secret: &[u8],
+    filter: &Filter,
+    wake: &Sender<()>,
+) -> (u16, &'static str) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let req = match read_request(stream) {
@@ -84,10 +135,13 @@ fn handle(stream: &TcpStream, secret: &[u8], wake: &Sender<()>) -> (u16, &'stati
     }
     match req.header("x-github-event") {
         Some("ping") => (200, "pong"),
-        Some("push") => {
-            let _ = wake.send(());
-            (202, "deploy check queued")
-        }
+        Some("push") => match filter.matches(&req.body) {
+            Ok(()) => {
+                let _ = wake.send(());
+                (202, "deploy check queued")
+            }
+            Err(msg) => (200, msg),
+        },
         _ => (200, "ignored"),
     }
 }
@@ -236,6 +290,39 @@ mod tests {
         assert_eq!(req.method, "POST");
         assert_eq!(req.header("x-github-event"), Some("push"));
         assert_eq!(req.body, b"hello");
+    }
+
+    #[test]
+    fn filters_pushes_by_branch_and_repository() {
+        let filter = Filter {
+            branch: "main".into(),
+            repository: Some("https://github.com/o/app".into()),
+        };
+        let push = |r: &str, url: &str| {
+            format!(r#"{{"ref":"{r}","repository":{{"html_url":"{url}"}}}}"#).into_bytes()
+        };
+        assert_eq!(
+            filter.matches(&push("refs/heads/main", "https://github.com/o/app")),
+            Ok(())
+        );
+        assert_eq!(
+            filter.matches(&push("refs/heads/dev", "https://github.com/o/app")),
+            Err("ignored: another branch")
+        );
+        assert_eq!(
+            filter.matches(&push("refs/tags/main", "https://github.com/o/app")),
+            Err("ignored: another branch")
+        );
+        assert_eq!(
+            filter.matches(&push("refs/heads/main", "https://github.com/o/other")),
+            Err("ignored: another repository")
+        );
+        assert!(filter.matches(b"not json").is_err());
+        let any_repo = Filter {
+            branch: "main".into(),
+            repository: None,
+        };
+        assert_eq!(any_repo.matches(br#"{"ref":"refs/heads/main"}"#), Ok(()));
     }
 
     #[test]

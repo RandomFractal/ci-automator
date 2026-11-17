@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
-    io::{self, BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read},
     os::unix::process::{CommandExt, ExitStatusExt},
     path::{Path, PathBuf},
     process::{self, Command, ExitStatus, Stdio},
@@ -16,15 +16,15 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    config,
+    config::Overrides,
     git::{Repo, short},
     interval::{self, Interval},
     log::{DEPLOY_START, Logger, now},
+    project::{FILE_NAME, Project},
     state::State,
     webhook,
 };
 
-pub const DEPLOY_FILE: &str = "DEPLOY.cia";
 const DEFAULT_TIMEOUT: Interval = Interval::new(10, 'm');
 const POLL: Duration = Duration::from_millis(100);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
@@ -32,6 +32,27 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const KEYWORDS: &[&str] = &[
     "RUN", "TRY", "RUNNER", "TIMEOUT", "WORKDIR", "ENV", "SLEEP", "RETRY", "WHEN", "CHANGED",
 ];
+/// Project settings: each may appear once, before the first step.
+const HEADER_KEYWORDS: &[&str] = &[
+    "LOCAL",
+    "REPOSITORY",
+    "BRANCH",
+    "INTERVAL",
+    "ROLLBACK",
+    "WEBHOOK",
+];
+
+#[derive(Debug, Default)]
+pub struct Cia {
+    /// As written; resolved by `Project`.
+    pub local: Option<String>,
+    pub repository: Option<String>,
+    pub branch: Option<String>,
+    pub interval: Option<Interval>,
+    pub rollback: Option<bool>,
+    pub webhook: Option<String>,
+    pub steps: Vec<Step>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum When {
@@ -132,13 +153,25 @@ impl Default for Settings {
 }
 
 /// Steps run in file order. Every problem is reported, not just the first.
-pub fn parse_steps(text: &str) -> Result<Vec<Step>> {
+pub fn parse(text: &str) -> Result<Cia> {
     let mut settings = Settings::default();
-    let mut steps = Vec::new();
+    let mut cia = Cia::default();
     let mut errors = Vec::new();
     for (line, instruction) in instructions(text) {
-        match parse_instruction(&mut settings, &instruction) {
-            Ok(Some(action)) => steps.push(Step {
+        let (keyword, rest) = instruction
+            .split_once(char::is_whitespace)
+            .map_or((instruction.as_str(), ""), |(k, r)| (k, r.trim()));
+        let result = if HEADER_KEYWORDS.contains(&keyword) {
+            if cia.steps.is_empty() {
+                parse_header(&mut cia, keyword, rest).map(|()| None)
+            } else {
+                Err(format!("{keyword} must come before the first step"))
+            }
+        } else {
+            parse_instruction(&mut settings, keyword, rest)
+        };
+        match result {
+            Ok(Some(action)) => cia.steps.push(Step {
                 line,
                 action,
                 timeout: settings.timeout,
@@ -153,9 +186,54 @@ pub fn parse_steps(text: &str) -> Result<Vec<Step>> {
         }
     }
     if !errors.is_empty() {
-        bail!("invalid {DEPLOY_FILE}: {}", errors.join("; "));
+        bail!("{}", errors.join("; "));
     }
-    Ok(steps)
+    Ok(cia)
+}
+
+fn parse_header(cia: &mut Cia, keyword: &str, rest: &str) -> Result<(), String> {
+    let value = match shell_words::split(rest).as_deref() {
+        Ok([word]) => word.clone(),
+        _ => return Err(format!("{keyword} takes one argument")),
+    };
+    let once = |set: bool| {
+        if set {
+            Err(format!("{keyword} is set more than once"))
+        } else {
+            Ok(())
+        }
+    };
+    match keyword {
+        "LOCAL" => once(cia.local.is_some())?,
+        "REPOSITORY" => once(cia.repository.is_some())?,
+        "BRANCH" => once(cia.branch.is_some())?,
+        "INTERVAL" => once(cia.interval.is_some())?,
+        "ROLLBACK" => once(cia.rollback.is_some())?,
+        "WEBHOOK" => once(cia.webhook.is_some())?,
+        _ => unreachable!("not a header keyword"),
+    }
+    match keyword {
+        "LOCAL" => cia.local = Some(value),
+        "REPOSITORY" => cia.repository = Some(value),
+        "BRANCH" => cia.branch = Some(value),
+        "INTERVAL" => cia.interval = Some(interval::parse(&value)?),
+        "ROLLBACK" => {
+            cia.rollback = Some(match value.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(format!("ROLLBACK expects on or off, got {value:?}")),
+            })
+        }
+        _ => {
+            if value.parse::<std::net::SocketAddr>().is_err() {
+                return Err(format!(
+                    "WEBHOOK expects an address like 127.0.0.1:9000, got {value:?}"
+                ));
+            }
+            cia.webhook = Some(value);
+        }
+    }
+    Ok(())
 }
 
 /// Joins continuation lines and drops comments, keeping each instruction's first line number.
@@ -185,10 +263,11 @@ fn instructions(text: &str) -> Vec<(usize, String)> {
 }
 
 /// Updates the settings, and returns the step if the instruction is one.
-fn parse_instruction(s: &mut Settings, instruction: &str) -> Result<Option<Action>, String> {
-    let (keyword, rest) = instruction
-        .split_once(char::is_whitespace)
-        .map_or((instruction, ""), |(k, r)| (k, r.trim()));
+fn parse_instruction(
+    s: &mut Settings,
+    keyword: &str,
+    rest: &str,
+) -> Result<Option<Action>, String> {
     let words = || shell_words::split(rest).map_err(|e| format!("cannot split {rest:?}: {e}"));
     let one = || match words()?.as_slice() {
         [word] => Ok(word.clone()),
@@ -263,11 +342,15 @@ fn parse_instruction(s: &mut Settings, instruction: &str) -> Result<Option<Actio
         }
         _ if keyword.starts_with('[') => {
             return Err(format!(
-                "unknown instruction {keyword}; {DEPLOY_FILE} no longer uses TOML sections, \
-                 see docs/DEPLOY.cia.md"
+                "unknown instruction {keyword}; CIA has one instruction per line, \
+                 see docs/CIA.md"
             ));
         }
-        _ if KEYWORDS.contains(&keyword.to_uppercase().as_str()) => {
+        _ if KEYWORDS
+            .iter()
+            .chain(HEADER_KEYWORDS)
+            .any(|k| *k == keyword.to_uppercase()) =>
+        {
             return Err(format!(
                 "instructions are uppercase: {}",
                 keyword.to_uppercase()
@@ -320,25 +403,14 @@ struct Run {
 }
 
 impl Run {
-    fn new(
-        repo: &Repo,
-        mode: Mode,
-        commit: &str,
-        previous: Option<&str>,
-        force: bool,
-    ) -> Result<Self> {
-        let base = match previous {
-            Some(prev) if !force && !repo.changed(prev, commit, &[DEPLOY_FILE.into()])? => {
-                Some(prev.to_string())
-            }
-            _ => None,
-        };
-        Ok(Self {
+    /// `all` runs every step regardless of CHANGED, e.g. with --force or an edited CIA.
+    fn new(mode: Mode, commit: &str, previous: Option<&str>, all: bool) -> Self {
+        Self {
             mode,
             commit: commit.to_string(),
             previous: previous.map(String::from),
-            base,
-        })
+            base: previous.filter(|_| !all).map(String::from),
+        }
     }
 
     /// Why the step is skipped as unchanged, if it is.
@@ -382,18 +454,23 @@ fn decide(state: &State, head: &str, pulled: bool, force: bool) -> Decision {
 }
 
 /// Returns Ok(false) when the run failed; the failure is already logged.
-pub fn deploy(repo: &Repo, opts: Options) -> Result<bool> {
+pub fn deploy(project: &Project, opts: Options) -> Result<bool> {
     if opts.dry_run {
-        dry_run(repo, opts.force)?;
+        dry_run(project, opts.force)?;
         return Ok(true);
     }
-    let log = Logger::new(repo);
-    let Some(_lock) = lock(repo)? else {
+    let log = Logger::new(&project.dir);
+    let Some(_lock) = lock(&project.repo)? else {
         log.info("skipped: another cia run is in progress");
         return Ok(true);
     };
-    let mut state = State::load(repo)?;
-    let result = check_and_deploy(repo, &log, &mut state, opts.force);
+    let mut state = State::load(&project.dir)?;
+    let result = check_and_deploy(project, &log, &mut state, opts.force);
+    record(&project.dir, &log, state, result)
+}
+
+/// Saves the outcome of a run; an error repeated from the last run is logged quietly.
+fn record(dir: &Path, log: &Logger, mut state: State, result: Result<String>) -> Result<bool> {
     state.last_run_at = Some(now());
     let ok = match result {
         Ok(summary) => {
@@ -413,19 +490,29 @@ pub fn deploy(repo: &Repo, opts: Options) -> Result<bool> {
             false
         }
     };
-    state.save(repo)?;
+    state.save(dir)?;
     Ok(ok)
 }
 
-pub fn watch(repo: &Repo) -> Result<()> {
-    let log = Logger::new(repo);
-    let cfg = config::effective(repo)?;
+/// Re-reads the CIA file before every run, so edits apply without a restart.
+pub fn watch(file: &Path, overrides: &Overrides) -> Result<()> {
+    let load = || Project::load(file).map(|p| p.with(overrides.clone()));
+    let project = load()?;
+    let dir = project.dir.clone();
+    let log = Logger::new(&dir);
+    let cfg = project.config()?;
     let mut interval = cfg.interval;
     let (wake_tx, wake) = mpsc::channel();
     if let Some(addr) = &cfg.webhook {
+        webhook::ensure_secret_logged(&dir, &log)?;
+        let filter = webhook::Filter {
+            branch: project.branch().to_string(),
+            repository: project.cia.repository.clone(),
+        };
         webhook::listen(
             addr,
-            webhook::load_secret(repo)?,
+            webhook::load_secret(&dir)?,
+            filter,
             log.clone(),
             wake_tx.clone(),
         )?;
@@ -438,10 +525,16 @@ pub fn watch(repo: &Repo) -> Result<()> {
             .map_or(String::new(), |a| format!(", webhook on {a}"))
     ));
     loop {
-        if let Err(e) = deploy(repo, Options::default()) {
+        let loaded = load();
+        let result = match &loaded {
+            Ok(project) => deploy(project, Options::default()),
+            Err(e) => State::load(&dir)
+                .and_then(|state| record(&dir, &log, state, Err(anyhow::anyhow!("{e:#}")))),
+        };
+        if let Err(e) = result {
             log.error(&format!("{e:#}"));
         }
-        match config::effective(repo) {
+        match loaded.and_then(|p| p.config()) {
             Ok(cfg) if cfg.interval != interval => {
                 log.event(&format!(
                     "interval changed from {interval} to {}",
@@ -462,21 +555,27 @@ pub fn watch(repo: &Repo) -> Result<()> {
     }
 }
 
-fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -> Result<String> {
-    let Some(branch) = repo.branch()? else {
-        return Ok(skip(log, "skipped: HEAD is detached"));
-    };
-    let cfg = config::effective(repo)?;
-    if !cfg.branches.contains(&branch) {
-        return Ok(skip(
-            log,
-            &format!("skipped: {branch} is not a target branch"),
-        ));
+fn check_and_deploy(
+    project: &Project,
+    log: &Logger,
+    state: &mut State,
+    force: bool,
+) -> Result<String> {
+    let repo = &project.repo;
+    let cfg = project.config()?;
+    let Fetched {
+        branch,
+        upstream,
+        head: before,
+        remote,
+    } = fetch(project)?;
+    let switched = state
+        .last_deployed_branch
+        .as_deref()
+        .is_some_and(|b| b != branch);
+    if switched {
+        state.last_failed = None;
     }
-    let upstream = upstream(repo, &branch)?;
-    repo.git(&["fetch", "--quiet"])?;
-    let before = repo.git(&["rev-parse", "HEAD"])?;
-    let remote = repo.git(&["rev-parse", "@{u}"])?;
     if !force && state.last_failed.as_deref() == Some(remote.as_str()) {
         bail!(
             "{upstream} is still at {}, which failed and was rolled back; \
@@ -486,16 +585,8 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     }
     let pulled = before != remote;
     if pulled {
-        ensure_fast_forward(repo, &branch, &upstream, &before, &remote)?;
-        if let Some(text) = repo.read_file_at(&remote, DEPLOY_FILE)? {
-            parse_steps(&text).with_context(|| {
-                format!(
-                    "{DEPLOY_FILE} at {} is invalid; refusing to pull",
-                    short(&remote)
-                )
-            })?;
-        }
-        repo.git(&["pull", "--ff-only", "--quiet"])?;
+        ensure_fast_forward(repo, branch, &upstream, &before, &remote)?;
+        repo.git(&["merge", "--ff-only", "--quiet", &remote])?;
     }
     let head = repo.git(&["rev-parse", "HEAD"])?;
     if pulled {
@@ -506,7 +597,13 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
         ));
     }
 
-    match decide(state, &head, pulled, force) {
+    if switched {
+        log.event(&format!(
+            "BRANCH changed from {} to {branch}; running every step, with no rollback across branches",
+            state.last_deployed_branch.as_deref().unwrap_or_default()
+        ));
+    }
+    match decide(state, &head, pulled, force || switched) {
         Decision::AlreadyDeployed => {
             return Ok(skip(
                 log,
@@ -519,7 +616,7 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
                  use cia --deploy --force to deploy it now",
                 short(&head)
             ));
-            mark_deployed(state, &head);
+            mark_deployed(project, state, &head)?;
             return Ok(format!("baseline {}", short(&head)));
         }
         Decision::Run => {}
@@ -528,24 +625,21 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     let good = state
         .last_deployed
         .clone()
-        .filter(|good| cfg.rollback && *good != head);
-    let steps = match read_steps(repo) {
-        Ok(steps) => steps,
-        Err(e) => return Err(roll_back(repo, log, state, &head, good, false, e)),
-    };
+        .filter(|good| cfg.rollback && !switched && *good != head);
+    let steps = &project.cia.steps;
+    let edited = project.snapshot()?.as_deref() != Some(project.text.as_str());
     let run = Run::new(
-        repo,
         Mode::Deploy,
         &head,
         state.last_deployed.as_deref(),
-        force,
-    )?;
+        force || edited || switched,
+    );
     if !steps.iter().any(|s| s.runs_in(Mode::Deploy)) {
         log.event(&format!(
-            "{branch} at {}: {DEPLOY_FILE} defines nothing to run",
+            "{branch} at {}: {FILE_NAME} defines nothing to run",
             short(&head)
         ));
-        mark_deployed(state, &head);
+        mark_deployed(project, state, &head)?;
         return Ok(format!("nothing to run at {}", short(&head)));
     }
 
@@ -556,35 +650,26 @@ fn check_and_deploy(repo: &Repo, log: &Logger, state: &mut State, force: bool) -
     ));
     state.last_attempted = Some(head.clone());
     let started = Instant::now();
-    if let Err(e) = run_steps(repo, log, &steps, &run) {
-        return Err(roll_back(repo, log, state, &head, good, true, e));
+    if let Err(e) = run_steps(repo, log, steps, &run) {
+        return Err(roll_back(project, log, state, &head, good, e));
     }
     log.event(&format!(
         "deployed {branch} at {} in {}",
         short(&head),
         secs(started.elapsed())
     ));
-    mark_deployed(state, &head);
+    mark_deployed(project, state, &head)?;
     Ok(format!("deployed {}", short(&head)))
 }
 
-fn read_steps(repo: &Repo) -> Result<Vec<Step>> {
-    match fs::read_to_string(repo.root.join(DEPLOY_FILE)) {
-        Ok(text) => parse_steps(&text),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(e).with_context(|| format!("cannot read {DEPLOY_FILE}")),
-    }
-}
-
-/// Resets to the last good commit and re-runs its steps, unless no step ran.
+/// Resets to the last good commit and re-runs the CIA that deployed it.
 /// Returns the deploy error with the rollback's outcome added.
 fn roll_back(
-    repo: &Repo,
+    project: &Project,
     log: &Logger,
     state: &mut State,
     failed: &str,
     good: Option<String>,
-    steps_ran: bool,
     err: anyhow::Error,
 ) -> anyhow::Error {
     let Some(good) = good else {
@@ -596,14 +681,22 @@ fn roll_back(
         short(&good)
     ));
     state.last_failed = Some(failed.to_string());
-    let result = repo
+    let result = project
+        .repo
         .git(&["reset", "--hard", "--quiet", &good])
         .and_then(|_| {
-            if steps_ran {
-                let run = Run::new(repo, Mode::Rollback, &good, Some(failed), false)?;
-                run_steps(repo, log, &read_steps(repo)?, &run)?;
-            }
-            Ok(())
+            let snapshot = project.snapshot()?;
+            let edited = snapshot.as_deref() != Some(project.text.as_str());
+            let steps = match &snapshot {
+                Some(text) => {
+                    parse(text)
+                        .map_err(|e| anyhow::anyhow!("invalid deployed.CIA: {e:#}"))?
+                        .steps
+                }
+                None => parse(&project.text)?.steps,
+            };
+            let run = Run::new(Mode::Rollback, &good, Some(failed), edited);
+            run_steps(&project.repo, log, &steps, &run)
         });
     match result {
         Ok(()) => {
@@ -614,22 +707,27 @@ fn roll_back(
     }
 }
 
-fn dry_run(repo: &Repo, force: bool) -> Result<()> {
-    let Some(branch) = repo.branch()? else {
-        println!("HEAD is detached; nothing would run");
-        return Ok(());
-    };
-    let cfg = config::effective(repo)?;
-    if !cfg.branches.contains(&branch) {
-        println!("{branch} is not a target branch; nothing would run");
-        return Ok(());
+fn dry_run(project: &Project, force: bool) -> Result<()> {
+    let repo = &project.repo;
+    let cfg = project.config()?;
+    let Fetched {
+        branch,
+        upstream,
+        head,
+        remote,
+    } = fetch(project)?;
+    let state = State::load(&project.dir)?;
+    let switched = state
+        .last_deployed_branch
+        .as_deref()
+        .is_some_and(|b| b != branch);
+    if switched {
+        println!(
+            "BRANCH changed from {}; every step would run, with no rollback",
+            state.last_deployed_branch.as_deref().unwrap_or_default()
+        );
     }
-    let upstream = upstream(repo, &branch)?;
-    repo.git(&["fetch", "--quiet"])?;
-    let head = repo.git(&["rev-parse", "HEAD"])?;
-    let remote = repo.git(&["rev-parse", "@{u}"])?;
-    let state = State::load(repo)?;
-    if !force && state.last_failed.as_deref() == Some(remote.as_str()) {
+    if !force && !switched && state.last_failed.as_deref() == Some(remote.as_str()) {
         println!(
             "{upstream} is still at {}, which failed and was rolled back; nothing would run (use --force)",
             short(&remote)
@@ -638,8 +736,8 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
     }
     let pulled = head != remote;
     if pulled {
-        ensure_fast_forward(repo, &branch, &upstream, &head, &remote)?;
-        let commits = repo.git(&["log", "--oneline", "HEAD..@{u}"])?;
+        ensure_fast_forward(repo, branch, &upstream, &head, &remote)?;
+        let commits = repo.git(&["log", "--oneline", &format!("HEAD..{remote}")])?;
         println!(
             "would pull {} commit(s) from {upstream}:",
             commits.lines().count()
@@ -651,7 +749,7 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
         println!("{branch} is up to date with {upstream}");
     }
 
-    let will_run = match decide(&state, &remote, pulled, force) {
+    let will_run = match decide(&state, &remote, pulled, force || switched) {
         Decision::AlreadyDeployed => {
             println!(
                 "{} is already deployed; nothing would run (use --force)",
@@ -669,30 +767,18 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
         Decision::Run => true,
     };
 
-    let text = if pulled {
-        repo.read_file_at(&remote, DEPLOY_FILE)?
-    } else {
-        match fs::read_to_string(repo.root.join(DEPLOY_FILE)) {
-            Ok(text) => Some(text),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e).with_context(|| format!("cannot read {DEPLOY_FILE}")),
-        }
-    };
-    let steps = text
-        .map(|t| parse_steps(&t))
-        .transpose()?
-        .unwrap_or_default();
+    let steps = &project.cia.steps;
     if steps.is_empty() {
-        println!("{DEPLOY_FILE} defines nothing to run");
+        println!("{FILE_NAME} defines nothing to run");
     }
+    let edited = project.snapshot()?.as_deref() != Some(project.text.as_str());
     let run = Run::new(
-        repo,
         Mode::Deploy,
         &remote,
         state.last_deployed.as_deref(),
-        force,
-    )?;
-    for step in &steps {
+        force || edited || switched,
+    );
+    for step in steps {
         let line = format!("{}{}", step.display(), step.details());
         if !step.runs_in(Mode::Deploy) {
             println!("only on rollback: {line}");
@@ -710,27 +796,60 @@ fn dry_run(repo: &Repo, force: bool) -> Result<()> {
     if let Some(good) = state
         .last_deployed
         .as_deref()
-        .filter(|g| cfg.rollback && *g != remote)
+        .filter(|g| cfg.rollback && !switched && *g != remote)
     {
         println!("if a step fails, would roll back to {}", short(good));
     }
     Ok(())
 }
-
 fn skip(log: &Logger, msg: &str) -> String {
     log.info(msg);
     msg.to_string()
 }
 
-fn mark_deployed(state: &mut State, head: &str) {
+fn mark_deployed(project: &Project, state: &mut State, head: &str) -> Result<()> {
     state.last_failed = None;
     state.last_deployed = Some(head.to_string());
+    state.last_deployed_branch = Some(project.branch().to_string());
     state.last_deployed_at = Some(now());
+    project.save_snapshot()
 }
 
-fn upstream(repo: &Repo, branch: &str) -> Result<String> {
-    repo.upstream()?.with_context(|| {
-        format!("{branch} has no upstream branch; set one with: git branch --set-upstream-to=origin/{branch}")
+struct Fetched<'a> {
+    branch: &'a str,
+    upstream: String,
+    head: String,
+    remote: String,
+}
+
+/// Checks the clone is on BRANCH and points at REPOSITORY, then fetches BRANCH from origin.
+fn fetch(project: &Project) -> Result<Fetched<'_>> {
+    let repo = &project.repo;
+    let branch = project.branch();
+    match repo.branch()? {
+        Some(b) if b == branch => {}
+        Some(b) => bail!(
+            "{} is on {b}, but {FILE_NAME} watches {branch}; check out {branch} there",
+            repo.root.display()
+        ),
+        None => bail!(
+            "{} has a detached HEAD, but {FILE_NAME} watches {branch}; check out {branch} there",
+            repo.root.display()
+        ),
+    }
+    project.verify_repository()?;
+    let tracking = format!("refs/remotes/origin/{branch}");
+    repo.git(&[
+        "fetch",
+        "--quiet",
+        "origin",
+        &format!("+refs/heads/{branch}:{tracking}"),
+    ])?;
+    Ok(Fetched {
+        branch,
+        upstream: format!("origin/{branch}"),
+        head: repo.git(&["rev-parse", "HEAD"])?,
+        remote: repo.git(&["rev-parse", &tracking])?,
     })
 }
 
@@ -955,6 +1074,10 @@ mod tests {
         }
     }
 
+    fn parse_steps(text: &str) -> Result<Vec<Step>> {
+        parse(text).map(|cia| cia.steps)
+    }
+
     fn err(text: &str) -> String {
         parse_steps(text).err().unwrap().to_string()
     }
@@ -1103,7 +1226,7 @@ RUN c
     fn points_old_toml_files_at_the_reference() {
         let e = err("[uv]\nrun = ['fast restart']\n");
         assert!(e.contains("line 1: unknown instruction [uv]"), "{e}");
-        assert!(e.contains("docs/DEPLOY.cia.md"), "{e}");
+        assert!(e.contains("docs/CIA.md"), "{e}");
     }
 
     #[test]

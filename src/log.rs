@@ -7,8 +7,6 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::git::Repo;
-
 const ACTIVITY_MAX_BYTES: u64 = 256 * 1024;
 const ACTIVITY_BACKUPS: u32 = 1;
 const EVENTS_MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -23,8 +21,7 @@ pub struct Logger {
 }
 
 impl Logger {
-    pub fn new(repo: &Repo) -> Self {
-        let dir = repo.cia_dir();
+    pub fn new(dir: &Path) -> Self {
         Self {
             activity: dir.join("activity.log"),
             events: dir.join("events.log"),

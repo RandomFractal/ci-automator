@@ -3,6 +3,7 @@ mod deploy;
 mod git;
 mod interval;
 mod log;
+mod project;
 mod service;
 mod state;
 mod webhook;
@@ -18,10 +19,11 @@ use anyhow::{Result, bail};
 use clap::{ArgGroup, Parser};
 
 use crate::{
-    config::Config,
-    git::{Repo, short},
+    config::{Config, Overrides},
+    git::short,
     interval::Interval,
     log::Logger,
+    project::{FILE_NAME, Project},
     service::Scope,
     state::State,
 };
@@ -32,44 +34,41 @@ use crate::{
     version,
     about = "CI automations for hosts where hosted CI is not available"
 )]
-#[command(group(ArgGroup::new("action").required(true).args([
-    "add_branch", "rm_branch", "reset_branches", "interval", "rollback", "webhook", "show_config",
-    "check", "deploy", "watch", "status", "log", "install_service", "uninstall_service",
+#[command(group(ArgGroup::new("action").args([
+    "show_config", "check", "deploy", "watch", "status", "log", "install_service",
+    "uninstall_service",
 ])))]
 struct Cli {
-    /// Add a branch that automations apply to
-    #[arg(long, value_name = "BRANCH")]
-    add_branch: Option<String>,
+    /// The CIA file, or a directory holding one (default: ./CIA)
+    #[arg(value_name = "CIA")]
+    cia: Option<PathBuf>,
 
-    /// Remove a branch that automations apply to
-    #[arg(long, value_name = "BRANCH")]
-    rm_branch: Option<String>,
-
-    /// Remove all branches that automations apply to
-    #[arg(long)]
-    reset_branches: bool,
-
-    /// How often --watch runs automations, e.g. 30s, 5m, 2h, 1d
-    #[arg(long, value_name = "NN{s|m|h|d}", value_parser = interval::parse)]
+    /// For this run, how often --watch runs, e.g. 30s, 5m, 2h, 1d (CIA: INTERVAL).
+    /// With --global and no action, sets the host default instead
+    #[arg(long, value_name = "NN{s|m|h|d}", value_parser = interval::parse,
+          conflicts_with_all = ["log", "install_service", "uninstall_service"])]
     interval: Option<Interval>,
 
-    /// Roll back to the last good commit when a deploy fails (default on)
-    #[arg(long, value_name = "on|off", value_parser = parse_on_off)]
+    /// For this run, roll back to the last good commit when a deploy fails (CIA: ROLLBACK).
+    /// With --global and no action, sets the host default instead
+    #[arg(long, value_name = "on|off", value_parser = parse_on_off,
+          conflicts_with_all = ["log", "install_service", "uninstall_service"])]
     rollback: Option<bool>,
 
-    /// Listen for GitHub push webhooks on ADDR (e.g. 127.0.0.1:9000) in --watch, or "off"
-    #[arg(long, value_name = "ADDR|off", conflicts_with = "global")]
+    /// For this run, listen for GitHub push webhooks on ADDR in --watch, or "off" (CIA: WEBHOOK)
+    #[arg(long, value_name = "ADDR|off", value_parser = parse_webhook,
+          conflicts_with_all = ["global", "log", "install_service", "uninstall_service"])]
     webhook: Option<String>,
 
-    /// Show the global, repo and effective config
+    /// Show the global, CIA and effective settings
     #[arg(long)]
     show_config: bool,
 
-    /// Check the config, DEPLOY.cia (or FILE) and that each step can run
-    #[arg(long, value_name = "FILE", num_args = 0..=1)]
-    check: Option<Option<PathBuf>>,
+    /// Check the config and the CIA file, and that each step can run
+    #[arg(long)]
+    check: bool,
 
-    /// Pull the current branch if it is a target and run DEPLOY.cia on changes
+    /// Pull BRANCH and run the CIA steps if there is something new
     #[arg(long)]
     deploy: bool,
 
@@ -77,7 +76,7 @@ struct Cli {
     #[arg(long)]
     watch: bool,
 
-    /// Show the last run, last deploy and service state for this repo
+    /// Show the last run, last deploy and service state
     #[arg(long)]
     status: bool,
 
@@ -85,19 +84,19 @@ struct Cli {
     #[arg(long)]
     log: bool,
 
-    /// Install and start a systemd service that runs --watch for this repo
+    /// Install and start a systemd service that runs --watch for this CIA file
     #[arg(long)]
     install_service: bool,
 
-    /// Stop and remove this repo's systemd service
+    /// Stop and remove this CIA file's systemd service
     #[arg(long)]
     uninstall_service: bool,
 
-    /// Use the global config, or the system-wide service, instead of this repo's
+    /// With --interval or --rollback and no action, set host defaults; with service commands, use a system-wide service
     #[arg(long, conflicts_with_all = ["show_config", "check", "deploy", "watch", "status", "log"])]
     global: bool,
 
-    /// With --deploy: run DEPLOY.cia even if this commit is already deployed
+    /// With --deploy: run the steps even if this commit is already deployed
     #[arg(long, requires = "deploy")]
     force: bool,
 
@@ -140,43 +139,29 @@ fn run(cli: Cli) -> Result<bool> {
     } else {
         Scope::User
     };
-    if let Some(branch) = &cli.add_branch {
-        add_branch(branch, cli.global)?;
-    } else if let Some(branch) = &cli.rm_branch {
-        rm_branch(branch, cli.global)?;
-    } else if cli.reset_branches {
-        edit_config(cli.global, |cfg| {
-            cfg.branches.clear();
-            Some("removed all target branches".into())
-        })?;
-    } else if let Some(interval) = cli.interval {
-        edit_config(cli.global, |cfg| {
-            cfg.interval = Some(interval);
-            Some(format!("interval set to {interval}"))
-        })?;
-    } else if let Some(on) = cli.rollback {
-        edit_config(cli.global, |cfg| {
-            cfg.rollback = Some(on);
-            Some(format!("rollback {}", on_off(on)))
-        })?;
-    } else if let Some(addr) = &cli.webhook {
-        set_webhook(addr)?;
-    } else if cli.show_config {
-        show_config()?;
-    } else if let Some(file) = &cli.check {
-        return check(&Repo::discover()?, file.as_deref());
+    let overrides = Overrides {
+        interval: cli.interval,
+        rollback: cli.rollback,
+        webhook: cli.webhook.clone(),
+    };
+    let file = || project::locate(cli.cia.as_deref());
+    let load = || Project::load(&file()?).map(|p| p.with(overrides.clone()));
+    if cli.show_config {
+        show_config(cli.cia.as_deref(), &overrides)?;
+    } else if cli.check {
+        return check(&file()?, &overrides);
     } else if cli.deploy {
         let opts = deploy::Options {
             force: cli.force,
             dry_run: cli.dry_run,
         };
-        return deploy::deploy(&Repo::discover()?, opts);
+        return deploy::deploy(&load()?, opts);
     } else if cli.watch {
-        deploy::watch(&Repo::discover()?)?;
+        deploy::watch(&file()?, &overrides)?;
     } else if cli.status {
-        status(&Repo::discover()?)?;
+        status(&load()?)?;
     } else if cli.log {
-        let logger = Logger::new(&Repo::discover()?);
+        let logger = Logger::new(&project::dir_of(&file()?));
         let path = if cli.activity {
             logger.activity
         } else {
@@ -193,142 +178,105 @@ fn run(cli: Cli) -> Result<bool> {
             None => println!("no log yet at {}", path.display()),
         }
     } else if cli.install_service {
-        service::install(&Repo::discover()?, scope)?;
+        service::install(&load()?, scope)?;
     } else if cli.uninstall_service {
-        service::uninstall(&Repo::discover()?, scope)?;
+        service::uninstall(&project::dir_of(&file()?), scope)?;
+    } else if cli.global && (cli.interval.is_some() || cli.rollback.is_some()) {
+        set_global(cli.interval, cli.rollback)?;
+    } else {
+        bail!(
+            "nothing to do: pass an action such as --deploy or --watch, \
+             or --global to set host defaults (see --help)"
+        );
     }
     Ok(true)
 }
 
-fn add_branch(branch: &str, global: bool) -> Result<()> {
-    if !git::is_valid_branch_name(branch)? {
-        bail!("'{branch}' is not a valid branch name");
-    }
-    edit_config(global, |cfg| {
-        if cfg.branches.iter().any(|b| b == branch) {
-            println!("{branch} is already a target branch");
-            return None;
-        }
-        cfg.branches.push(branch.to_string());
-        Some(format!("added target branch {branch}"))
-    })
-}
-
-fn rm_branch(branch: &str, global: bool) -> Result<()> {
-    let set_globally = !global
-        && Config::load(&config::global_path()?)?
-            .branches
-            .iter()
-            .any(|b| b == branch);
-    edit_config(global, |cfg| {
-        let before = cfg.branches.len();
-        cfg.branches.retain(|b| b != branch);
-        if cfg.branches.len() < before {
-            return Some(format!("removed target branch {branch}"));
-        }
-        if set_globally {
-            println!("{branch} is set in the global config; use --global to remove it");
-        } else {
-            println!("{branch} is not a target branch");
-        }
-        None
-    })
-}
-
-/// Applies `change` and saves; it returns the change description, or None for no change.
-/// Repo-level changes go to the events log. Global ones have no repo to log to.
-fn edit_config(global: bool, change: impl FnOnce(&mut Config) -> Option<String>) -> Result<()> {
-    let repo = if global {
-        None
-    } else {
-        Some(Repo::discover()?)
-    };
-    let path = match &repo {
-        Some(repo) => config::repo_path(repo),
-        None => config::global_path()?,
-    };
+fn set_global(interval: Option<Interval>, rollback: Option<bool>) -> Result<()> {
+    let path = config::global_path()?;
     let mut cfg = Config::load(&path)?;
-    let Some(msg) = change(&mut cfg) else {
-        return Ok(());
-    };
-    cfg.save(&path)?;
-    match &repo {
-        Some(repo) => Logger::new(repo).event(&format!("config: {msg}")),
-        None => println!("{msg} (global)"),
+    if let Some(interval) = interval {
+        cfg.interval = Some(interval);
+        println!("interval set to {interval} (global)");
     }
-    Ok(())
+    if let Some(on) = rollback {
+        cfg.rollback = Some(on);
+        println!("rollback {} (global)", on_off(on));
+    }
+    cfg.save(&path)
 }
 
-fn set_webhook(addr: &str) -> Result<()> {
-    if addr == "off" {
-        return edit_config(false, |cfg| {
-            cfg.webhook.take().map(|_| "webhook off".to_string())
-        });
-    }
-    if addr.parse::<std::net::SocketAddr>().is_err() {
-        bail!("'{addr}' is not an address like 127.0.0.1:9000");
-    }
-    edit_config(false, |cfg| {
-        cfg.webhook = Some(addr.to_string());
-        Some(format!("webhook on {addr}"))
-    })?;
-    let repo = Repo::discover()?;
-    let (secret, created) = webhook::ensure_secret(&repo)?;
-    if created {
-        println!(
-            "created the webhook secret {}",
-            webhook::secret_path(&repo).display()
-        );
-    }
-    println!(
-        "In GitHub, add a webhook under Settings > Webhooks with content type application/json, \
-         the push event, and this secret:\n  {secret}\n\
-         Point it at a public URL that forwards to {addr}, such as a reverse proxy or tunnel. \
-         Restart --watch or the service to start listening."
-    );
-    Ok(())
-}
-
-fn show_config() -> Result<()> {
-    let print = |label: &str, path: &std::path::Path, cfg: &Config| {
-        println!("{label} ({})", path.display());
-        println!("  branches: {}", list(&cfg.branches));
+fn show_config(cia: Option<&Path>, overrides: &Overrides) -> Result<()> {
+    let print = |label: String,
+                 interval: Option<Interval>,
+                 rollback: Option<bool>,
+                 webhook: Option<&str>| {
+        println!("{label}");
         println!(
             "  interval: {}",
-            cfg.interval.map_or("-".into(), |i| i.to_string())
+            interval.map_or("-".into(), |i| i.to_string())
         );
-        println!("  rollback: {}", cfg.rollback.map_or("-", on_off));
-        println!("  webhook:  {}", cfg.webhook.as_deref().unwrap_or("-"));
+        println!("  rollback: {}", rollback.map_or("-", on_off));
+        if let Some(webhook) = webhook {
+            println!("  webhook:  {webhook}");
+        }
     };
     let global_path = config::global_path()?;
-    print("global", &global_path, &Config::load(&global_path)?);
-    let Ok(repo) = Repo::discover() else {
-        println!("(not inside a git repository)");
-        return Ok(());
+    let global = Config::load(&global_path)?;
+    print(
+        format!("global ({})", global_path.display()),
+        global.interval,
+        global.rollback,
+        None,
+    );
+    let project = match project::locate(cia) {
+        Ok(file) => Project::load(&file)?.with(overrides.clone()),
+        Err(e) if cia.is_none() => {
+            println!("({e:#})");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
     };
-    let repo_path = config::repo_path(&repo);
-    print("repo", &repo_path, &Config::load(&repo_path)?);
-    let eff = config::effective(&repo)?;
+    let c = &project.cia;
+    print(
+        format!("cia ({})", project.file.display()),
+        c.interval,
+        c.rollback,
+        Some(c.webhook.as_deref().unwrap_or("-")),
+    );
+    if overrides.interval.is_some() || overrides.rollback.is_some() || overrides.webhook.is_some() {
+        print(
+            "flags".into(),
+            overrides.interval,
+            overrides.rollback,
+            Some(overrides.webhook.as_deref().unwrap_or("-")),
+        );
+    }
+    let eff = project.config()?;
     println!("effective");
-    println!("  branches: {}", list(&eff.branches));
     println!("  interval: {}", eff.interval);
     println!("  rollback: {}", on_off(eff.rollback));
     println!("  webhook:  {}", eff.webhook.as_deref().unwrap_or("off"));
     Ok(())
 }
 
-fn status(repo: &Repo) -> Result<()> {
-    let eff = config::effective(repo)?;
-    let state = State::load(repo)?;
-    let branch = match repo.branch()? {
-        Some(b) if eff.branches.contains(&b) => format!("{b} (target)"),
-        Some(b) => format!("{b} (not a target)"),
-        None => "detached HEAD".into(),
+fn status(project: &Project) -> Result<()> {
+    let repo = &project.repo;
+    let eff = project.config()?;
+    let state = State::load(&project.dir)?;
+    let checked_out = match repo.branch()? {
+        Some(b) if b == project.branch() => b,
+        Some(b) => format!("{b} (not BRANCH; deploys will fail)"),
+        None => "detached HEAD (deploys will fail)".into(),
     };
     let or_never = |v: &Option<String>| v.clone().unwrap_or_else(|| "never".into());
-    println!("repo:          {}", repo.root.display());
-    println!("branch:        {branch}");
-    println!("targets:       {}", list(&eff.branches));
+    println!("cia file:      {}", project.file.display());
+    println!("local:         {}", repo.root.display());
+    println!("branch:        {}", project.branch());
+    println!("checked out:   {checked_out}");
+    if let Some(url) = &project.cia.repository {
+        println!("repository:    {url}");
+    }
     println!("interval:      {}", eff.interval);
     if let Some(addr) = &eff.webhook {
         println!("webhook:       {addr} (while --watch runs)");
@@ -355,113 +303,139 @@ fn status(repo: &Repo) -> Result<()> {
         (Some(sha), at) => println!("last deployed: {} at {}", short(sha), or_never(at)),
         (None, _) => println!("last deployed: never"),
     }
-    let services = service::describe(repo);
+    let services = service::describe(&project.dir);
     if services.is_empty() {
         println!("service:       not installed");
     }
     for s in services {
         println!("service:       {s}");
     }
-    let logger = Logger::new(repo);
+    let logger = Logger::new(&project.dir);
     println!("events log:    {}", logger.events.display());
     println!("activity log:  {}", logger.activity.display());
     Ok(())
 }
 
 /// Prints every problem it finds; returns false if any of them would make a deploy fail.
-fn check(repo: &Repo, file: Option<&Path>) -> Result<bool> {
+fn check(file: &Path, overrides: &Overrides) -> Result<bool> {
     let mut errors = 0;
     let mut error = |msg: String| {
         println!("error: {msg}");
         errors += 1;
     };
-    for path in [config::global_path()?, config::repo_path(repo)] {
-        if let Err(e) = Config::load(&path) {
+    if let Err(e) = Config::load(&config::global_path()?) {
+        error(format!("{e:#}"));
+    }
+    let dir = project::dir_of(file);
+    let text = fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", file.display()))?;
+    let cia = match project::parse(file, &text) {
+        Ok(cia) => cia,
+        Err(e) => {
             error(format!("{e:#}"));
+            return Ok(false);
+        }
+    };
+    println!("{}: {} step(s)", file.display(), cia.steps.len());
+    let repo = match project::open_local(&dir, cia.local.as_deref()) {
+        Ok(repo) => repo,
+        Err(e) => {
+            error(format!("{e:#}"));
+            return Ok(false);
+        }
+    };
+    println!("local: {}", repo.root.display());
+    for name in ["DEPLOY.cia", FILE_NAME] {
+        if repo.tracks(&[name.into()])? {
+            println!(
+                "  warning: the clone tracks {name}, which cia ignores; steps come from {}",
+                file.display()
+            );
         }
     }
 
-    let (path, required) = match file {
-        Some(f) => (f.to_path_buf(), true),
-        None => (repo.root.join(deploy::DEPLOY_FILE), false),
-    };
-    match fs::read_to_string(&path) {
-        Ok(text) => match deploy::parse_steps(&text) {
-            Ok(steps) => {
-                println!("{}: {} step(s)", path.display(), steps.len());
-                let mut seen_dirs = Vec::new();
-                let mut seen_changed = Vec::new();
-                for step in &steps {
-                    let dir = repo.root.join(&step.workdir);
-                    if !seen_dirs.contains(&step.workdir) {
-                        seen_dirs.push(step.workdir.clone());
-                        if !dir.is_dir() {
-                            let msg = format!(
-                                "line {}: WORKDIR {} does not exist",
-                                step.line,
-                                step.workdir.display()
-                            );
-                            if step.workdir.is_absolute() {
-                                println!("  warning: {msg}; fine if an earlier step creates it");
-                            } else {
-                                error(msg);
-                            }
-                        }
-                    }
-                    if !step.changed.is_empty() && !seen_changed.contains(&step.changed) {
-                        seen_changed.push(step.changed.clone());
-                        if !repo.tracks(&step.changed)? {
-                            println!(
-                                "  warning: line {}: CHANGED {} matches no tracked file",
-                                step.line,
-                                step.changed.join(" ")
-                            );
-                        }
-                    }
-                    let deploy::Action::Command { program, .. } = &step.action else {
-                        println!("  ok: {}", step.display());
-                        continue;
-                    };
-                    match find_program(&dir, program) {
-                        Program::Found => println!("  ok: {}{}", step.display(), step.details()),
-                        Program::MissingPath => println!(
-                            "  warning: {program} does not exist yet; fine if an earlier step creates it"
-                        ),
-                        Program::NotOnPath => error(format!(
-                            "line {}: {program} is not on PATH ({})",
-                            step.line,
-                            step.display()
-                        )),
-                    }
+    let mut seen_dirs = Vec::new();
+    let mut seen_changed = Vec::new();
+    for step in &cia.steps {
+        let step_dir = repo.root.join(&step.workdir);
+        if !seen_dirs.contains(&step.workdir) {
+            seen_dirs.push(step.workdir.clone());
+            if !step_dir.is_dir() {
+                let msg = format!(
+                    "line {}: WORKDIR {} does not exist",
+                    step.line,
+                    step.workdir.display()
+                );
+                if step.workdir.is_absolute() {
+                    println!("  warning: {msg}; fine if an earlier step creates it");
+                } else {
+                    error(msg);
                 }
             }
-            Err(e) => error(format!("{e:#}")),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => {
-            println!("no {}; deploys will run nothing", deploy::DEPLOY_FILE)
         }
-        Err(e) => error(format!("cannot read {}: {e}", path.display())),
+        if !step.changed.is_empty() && !seen_changed.contains(&step.changed) {
+            seen_changed.push(step.changed.clone());
+            if !repo.tracks(&step.changed)? {
+                println!(
+                    "  warning: line {}: CHANGED {} matches no tracked file",
+                    step.line,
+                    step.changed.join(" ")
+                );
+            }
+        }
+        let deploy::Action::Command { program, .. } = &step.action else {
+            println!("  ok: {}", step.display());
+            continue;
+        };
+        match find_program(&step_dir, program) {
+            Program::Found => println!("  ok: {}{}", step.display(), step.details()),
+            Program::MissingPath => println!(
+                "  warning: {program} does not exist yet; fine if an earlier step creates it"
+            ),
+            Program::NotOnPath => error(format!(
+                "line {}: {program} is not on PATH ({})",
+                step.line,
+                step.display()
+            )),
+        }
     }
 
-    if let Ok(eff) = config::effective(repo) {
-        if let Some(addr) = &eff.webhook {
-            match webhook::load_secret(repo) {
-                Ok(_) => println!("webhook: {addr}"),
-                Err(e) => error(format!("{e:#}; run cia --webhook {addr} to create it")),
-            }
-        }
-        match repo.branch()? {
-            None => println!("warning: HEAD is detached; deploys will do nothing"),
-            Some(b) if !eff.branches.contains(&b) => {
-                println!("warning: {b} is not a target branch; deploys will do nothing")
-            }
-            Some(b) => match repo.upstream()? {
-                Some(u) => println!("branch: {b} (target), upstream {u}"),
-                None => error(format!("{b} has no upstream branch")),
-            },
+    if let Ok(eff) = config::effective(&cia, overrides)
+        && let Some(addr) = &eff.webhook
+    {
+        let secret = webhook::secret_path(&dir);
+        if secret.exists() {
+            println!("webhook: {addr}, secret {}", secret.display());
+        } else {
+            println!(
+                "webhook: {addr}; --watch or --install-service will create the secret {}",
+                secret.display()
+            );
         }
     }
-    let services = service::describe(repo);
+    let branch = cia.branch.as_deref().unwrap_or_default();
+    match (cia.branch.is_some(), repo.branch()?) {
+        (false, _) => error(format!("{FILE_NAME} needs a BRANCH line")),
+        (true, Some(b)) if b == branch => println!("branch: {b}"),
+        (true, Some(b)) => error(format!(
+            "{} is on {b}, but BRANCH is {branch}",
+            repo.root.display()
+        )),
+        (true, None) => error(format!(
+            "{} has a detached HEAD, but BRANCH is {branch}",
+            repo.root.display()
+        )),
+    }
+    if let Some(expected) = &cia.repository {
+        match repo.origin_url()? {
+            Some(url) if project::same_repository(&url, expected) => {
+                println!("repository: {url}")
+            }
+            Some(url) => error(format!("origin is {url}, but REPOSITORY is {expected}")),
+            None => error(format!("{} has no origin remote", repo.root.display())),
+        }
+    }
+    let services = service::describe(&dir);
     for s in &services {
         println!("service: {s}");
     }
@@ -502,6 +476,14 @@ fn find_program(dir: &Path, program: &str) -> Program {
     }
 }
 
+fn parse_webhook(s: &str) -> Result<String, String> {
+    if s == "off" || s.parse::<std::net::SocketAddr>().is_ok() {
+        Ok(s.to_string())
+    } else {
+        Err("expected an address like 127.0.0.1:9000, or off".into())
+    }
+}
+
 fn parse_on_off(s: &str) -> Result<bool, String> {
     match s {
         "on" => Ok(true),
@@ -512,12 +494,4 @@ fn parse_on_off(s: &str) -> Result<bool, String> {
 
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
-}
-
-fn list(items: &[String]) -> String {
-    if items.is_empty() {
-        "-".into()
-    } else {
-        items.join(", ")
-    }
 }

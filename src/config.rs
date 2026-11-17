@@ -6,21 +6,25 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{git::Repo, interval::Interval};
+use crate::{deploy::Cia, interval::Interval};
 
 pub const DEFAULT_INTERVAL: Interval = Interval::new(5, 'm');
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub branches: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interval: Option<Interval>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback: Option<bool>,
-    /// Address `--watch` listens on for GitHub push webhooks. Repo config only.
-    #[serde(skip_serializing_if = "Option::is_none")]
+}
+
+/// Flags given for one run; they beat the CIA file, which beats the global config.
+#[derive(Clone, Default)]
+pub struct Overrides {
+    pub interval: Option<Interval>,
+    pub rollback: Option<bool>,
+    /// An address, or "off".
     pub webhook: Option<String>,
 }
 
@@ -45,34 +49,30 @@ impl Config {
 }
 
 pub struct Effective {
-    pub branches: Vec<String>,
     pub interval: Interval,
     pub rollback: bool,
     pub webhook: Option<String>,
 }
 
-pub fn effective(repo: &Repo) -> Result<Effective> {
+pub fn effective(cia: &Cia, overrides: &Overrides) -> Result<Effective> {
     let global = Config::load(&global_path()?)?;
-    let local = Config::load(&repo_path(repo))?;
-    let mut branches = global.branches;
-    for b in local.branches {
-        if !branches.contains(&b) {
-            branches.push(b);
-        }
-    }
     Ok(Effective {
-        branches,
-        interval: local
+        interval: overrides
             .interval
+            .or(cia.interval)
             .or(global.interval)
             .unwrap_or(DEFAULT_INTERVAL),
-        rollback: local.rollback.or(global.rollback).unwrap_or(true),
-        webhook: local.webhook,
+        rollback: overrides
+            .rollback
+            .or(cia.rollback)
+            .or(global.rollback)
+            .unwrap_or(true),
+        webhook: match overrides.webhook.as_deref() {
+            Some("off") => None,
+            Some(addr) => Some(addr.to_string()),
+            None => cia.webhook.clone(),
+        },
     })
-}
-
-pub fn repo_path(repo: &Repo) -> PathBuf {
-    repo.cia_dir().join("config.toml")
 }
 
 pub fn global_path() -> Result<PathBuf> {
@@ -98,17 +98,13 @@ mod tests {
     #[test]
     fn round_trips_toml() {
         let cfg = Config {
-            branches: vec!["main".into(), "staging".into()],
             interval: Some(Interval::new(30, 's')),
             rollback: Some(false),
-            webhook: Some("127.0.0.1:9000".into()),
         };
         let text = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
-        assert_eq!(back.branches, cfg.branches);
         assert_eq!(back.interval, cfg.interval);
         assert_eq!(back.rollback, cfg.rollback);
-        assert_eq!(back.webhook, cfg.webhook);
     }
 
     #[test]
@@ -119,6 +115,30 @@ mod tests {
     #[test]
     fn rejects_bad_interval_and_unknown_keys() {
         assert!(toml::from_str::<Config>("interval = \"5x\"").is_err());
-        assert!(toml::from_str::<Config>("branch = [\"main\"]").is_err());
+        assert!(toml::from_str::<Config>("branches = [\"main\"]").is_err());
+        assert!(toml::from_str::<Config>("webhook = \"127.0.0.1:9000\"").is_err());
+    }
+
+    #[test]
+    fn flags_beat_the_cia_file() {
+        let cia = Cia {
+            interval: Some(Interval::new(1, 'h')),
+            rollback: Some(false),
+            webhook: Some("127.0.0.1:9000".into()),
+            ..Cia::default()
+        };
+        let eff = effective(&cia, &Overrides::default()).unwrap();
+        assert_eq!(eff.interval, Interval::new(1, 'h'));
+        assert!(!eff.rollback);
+        assert_eq!(eff.webhook.as_deref(), Some("127.0.0.1:9000"));
+        let flags = Overrides {
+            interval: Some(Interval::new(30, 's')),
+            rollback: Some(true),
+            webhook: Some("off".into()),
+        };
+        let eff = effective(&cia, &flags).unwrap();
+        assert_eq!(eff.interval, Interval::new(30, 's'));
+        assert!(eff.rollback);
+        assert_eq!(eff.webhook, None);
     }
 }
